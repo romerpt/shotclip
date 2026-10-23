@@ -8,7 +8,7 @@ BIN="$HOME/.local/bin/shotclip"
 DESKTOP="$HOME/.local/share/applications/$APP_ID.desktop"
 AUTOSTART="$HOME/.config/autostart/$APP_ID.desktop"
 STATE_DIR="$HOME/.local/state/shotclip"
-LOG="$STATE_DIR/shotclip.log"
+LOGS="journalctl --user -t shotclip"
 SAVED_TRAY="$STATE_DIR/toggle-message-tray.orig"
 
 KB_SCHEMA="org.gnome.settings-daemon.plugins.media-keys"
@@ -87,7 +87,7 @@ cat >"$AUTOSTART" <<EOF
 Type=Application
 Name=ShotClip (daemon)
 Comment=Screenshot clipboard history daemon
-Exec=$BIN --daemon
+Exec=systemd-cat -t shotclip $BIN --daemon
 Icon=edit-paste
 Terminal=false
 NoDisplay=true
@@ -123,8 +123,9 @@ gsettings set org.gnome.shell enabled-extensions "$(list_edit "$enabled" "$EXT_U
 gnome-extensions enable "$EXT_UUID" >/dev/null 2>&1 || true
 
 # 8. Start the daemon ----------------------------------------------------------
-say "Starting daemon (log: $LOG)"
-setsid -f "$BIN" --daemon >>"$LOG" 2>&1 </dev/null
+say "Starting daemon (logs: $LOGS)"
+rm -f "$STATE_DIR/shotclip.log"  # older versions logged to a file
+setsid -f systemd-cat -t shotclip "$BIN" --daemon </dev/null
 for _ in $(seq 50); do pgrep -f "python3 $BIN --daemon" >/dev/null && break; sleep 0.1; done
 sleep 1
 if pgrep -f "python3 $BIN" >/dev/null; then
@@ -140,6 +141,6 @@ if pgrep -f "python3 $BIN" >/dev/null; then
         say "Log out and back in to load the new shell extension (Wayland only loads extension code at login)."
     fi
 else
-    echo "ShotClip failed to start; see $LOG" >&2
+    echo "ShotClip failed to start; see: $LOGS" >&2
     exit 1
 fi

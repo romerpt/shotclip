@@ -33,6 +33,7 @@ Press **Super+V**.
 |---|---|
 | Enter / click / 1–9 | Copy the item and paste it into the previous app |
 | Shift+Enter | Copy only (paste yourself with Ctrl+V) |
+| Ctrl+Enter | Paste with formatting (items marked "formatted"; for apps that accept HTML such as LibreOffice, browsers, mail) |
 | Arrows, Home, End | Move the selection |
 | P | Pin / unpin (pinned items are never removed) |
 | Del | Remove the item |
@@ -41,9 +42,12 @@ Press **Super+V**.
 | Esc, or click elsewhere | Close (closes the search first if it is open) |
 
 New screenshots (Print Screen) appear automatically, as do text and images
-copied in any app. When a copy offers both text and an image (e.g. a
-spreadsheet range), the text is kept. Copies that password managers mark as
-secret are skipped.
+copied in any app. Text copied with formatting (web pages, LibreOffice, mail)
+keeps it: Enter pastes the plain text (works everywhere), Ctrl+Enter pastes the
+formatting into apps that accept HTML. When
+a copy offers both text and an image (e.g. a spreadsheet range), the text is
+kept. Copies that password managers mark as secret are skipped, as are copies
+made in apps listed in `exclude_apps`.
 
 ## What the installer changes
 
@@ -64,8 +68,13 @@ secret are skipped.
 | `import_existing` | 20 | Screenshots imported on first run |
 | `capture_text` | `true` | Record copied text |
 | `auto_paste` | `true` | Paste after picking (otherwise copy only) |
+| `exclude_apps` | `[]` | Apps whose copies are never recorded, e.g. `["org.keepassxc.KeePassXC", "1password"]` |
 
-Restart after editing: `shotclip --quit; setsid -f shotclip --daemon`
+`exclude_apps` and the other settings apply as soon as the file is saved
+(`max_items` on the next copy). To find an app's id, copy something in it and
+look at the log: each entry says `from <ids>`; any of those ids works.
+
+Logs: `journalctl --user -t shotclip`
 
 ## Privacy
 

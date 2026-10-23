@@ -12,7 +12,12 @@ Usage:
   shotclip --copy-latest  (debug) copy the newest item to the clipboard
 
 In the picker, Enter/click/1-9 copy and paste into the previous app (set
-"auto_paste": false in the config to only copy); Shift+Enter only copies.
+"auto_paste": false in the config to only copy); Shift+Enter only copies;
+Ctrl+Enter pastes text with its formatting (HTML; only apps that accept HTML,
+like LibreOffice, browsers and mail, can paste it). Copies made in apps listed in
+"exclude_apps" are never recorded (the journal shows each copy's app ids).
+
+Logs: journalctl --user -t shotclip
 """
 
 import gettext
@@ -49,7 +54,7 @@ CONFIG_DIR = os.path.join(GLib.get_user_config_dir(), "shotclip")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
 DEFAULT_CONFIG = {"max_items": 50, "watch_dirs": [], "import_existing": 20,
-                  "capture_text": True, "auto_paste": True}
+                  "capture_text": True, "auto_paste": True, "exclude_apps": []}
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp")  # screenshot files to pick up
 # Known translations of GNOME Shell's "Screenshots" folder, used as fallbacks
@@ -69,6 +74,7 @@ SCREENSHOT_DIR_FALLBACKS = (
 THUMB_W, THUMB_H = 320, 200
 SETTLE_MS = 400  # wait after a file event before reading the file
 MAX_TEXT_CHARS = 100_000  # larger copies are not kept in the history
+MAX_HTML_CHARS = 500_000  # formatting of larger copies is dropped (text kept)
 MAX_IMAGE_BYTES = 32 * 1024 * 1024  # larger copied images are not kept
 # GNOME's screenshot tool both saves a file and copies the image; a copied
 # image and a new screenshot file with the same size this close together are
@@ -80,7 +86,10 @@ MIME_FOR_IMAGE_EXT = {ext: mime for mime, ext in IMAGE_EXT_FOR_MIME.items()} | {
 
 
 def log(*args):
-    print(f"[shotclip {time.strftime('%H:%M:%S')}]", *args, file=sys.stderr, flush=True)
+    if os.environ.get("JOURNAL_STREAM"):  # stderr goes to the journal
+        print(*args, file=sys.stderr, flush=True)
+    else:
+        print(f"[shotclip {time.strftime('%H:%M:%S')}]", *args, file=sys.stderr, flush=True)
 
 
 def atomic_write_json(path, data):
@@ -105,20 +114,13 @@ def is_image_name(name):
     return name.lower().endswith(IMAGE_EXTS) and not name.startswith(".")
 
 
-def clipboard_provider(item):
-    """Content provider for a history item (what gdk_clipboard_set_texture()
-    and set_text() do in C; neither is exposed to Python).
-
-    The GValue type must be exactly GdkTexture / gchararray: GTK looks up its
-    serializers by that type, and PyGObject would otherwise type the value as
-    the concrete subclass (GdkMemoryTexture), which offers no formats at all.
-    """
-    if item["kind"] == "text":
-        value = GObject.Value(GObject.TYPE_STRING, item["text"])
+def decode_html(data):
+    """text/html as copied: UTF-8, or UTF-16 with a BOM (some browsers)."""
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        text = data.decode("utf-16", errors="replace")
     else:
-        texture = Gdk.Texture.new_from_filename(item["file"])
-        value = GObject.Value(Gdk.Texture, texture)
-    return Gdk.ContentProvider.new_for_value(value)
+        text = data.decode("utf-8", errors="replace")
+    return text.replace("\x00", "")
 
 
 # --------------------------------------------------------------------------
@@ -144,6 +146,9 @@ def load_config():
         cfg["import_existing"] = DEFAULT_CONFIG["import_existing"]
     if not isinstance(cfg["watch_dirs"], list):
         cfg["watch_dirs"] = []
+    if not isinstance(cfg["exclude_apps"], list):
+        cfg["exclude_apps"] = []
+    cfg["exclude_apps"] = [str(a).casefold().removesuffix(".desktop") for a in cfg["exclude_apps"]]
     return cfg
 
 
@@ -178,7 +183,8 @@ class History:
     """Index of stored items.
 
     Image items: kind="image", sha1, file, source, added, pinned, width, height.
-    Text items:  kind="text", sha1, text, added, pinned.
+    Text items:  kind="text", sha1, text, added, pinned, html (optional
+                 formatting as copied).
     """
 
     def __init__(self, max_items):
@@ -309,10 +315,13 @@ class History:
             self._drop(item)
         self.changed()
 
-    def add_text(self, text):
-        """Store a copied text. Returns the item, or None if it is ignored."""
+    def add_text(self, text, html=None):
+        """Store a copied text (with its HTML formatting, if any). Returns the
+        item, or None if it is ignored."""
         if not text or not text.strip() or len(text) > MAX_TEXT_CHARS:
             return None
+        if html and len(html) > MAX_HTML_CHARS:
+            html = None
         sha = hashlib.sha1(text.encode("utf-8")).hexdigest()
         item = self.get(sha)
         if item:
@@ -321,6 +330,8 @@ class History:
             item = {"kind": "text", "sha1": sha, "text": text,
                     "added": time.time(), "pinned": False}
             self.items.append(item)
+        if html:
+            item["html"] = html
         self.trim()
         self.changed()
         return item
@@ -433,10 +444,9 @@ def format_time(ts):
 
 
 class PickerWindow(Adw.ApplicationWindow):
-    def __init__(self, app, auto_copy=False):
+    def __init__(self, app):
         super().__init__(application=app, title=APP_NAME)
         self.app = app
-        self.auto_copy = auto_copy
         self.history = app.history
         self.was_active = False
         self.closing = False
@@ -490,7 +500,7 @@ class PickerWindow(Adw.ApplicationWindow):
 
         hint = Gtk.Label(
             label="Enter/click paste · Shift+Enter copy only · 1–9 quick paste · "
-                  "P pin · Del remove · Ctrl+F search · Esc close",
+                  "Ctrl+Enter with formatting · P pin · Del remove · Ctrl+F search · Esc close",
             css_classes=["dim-label", "caption"], margin_top=6, margin_bottom=8,
             wrap=True, justify=Gtk.Justification.CENTER,
         )
@@ -499,7 +509,8 @@ class PickerWindow(Adw.ApplicationWindow):
         view.add_top_bar(header)
         view.add_top_bar(self.search_bar)
         view.add_bottom_bar(hint)
-        self.set_content(view)
+        self.toasts = Adw.ToastOverlay(child=view)
+        self.set_content(self.toasts)
 
         keys = Gtk.EventControllerKey(propagation_phase=Gtk.PropagationPhase.CAPTURE)
         keys.connect("key-pressed", self._on_key)
@@ -591,6 +602,8 @@ class PickerWindow(Adw.ApplicationWindow):
         label_text = format_time(item.get("added", 0))
         if item["kind"] == "text":
             label_text += f" · {len(item['text'])} chars"
+            if item.get("html"):
+                label_text += " · formatted"
         if item.get("pinned"):
             label_text = "📌 " + label_text
         caption = Gtk.Label(label=label_text, css_classes=["caption"], margin_top=4,
@@ -602,7 +615,10 @@ class PickerWindow(Adw.ApplicationWindow):
         child = Gtk.FlowBoxChild(child=box)
         child.sha1 = sha
         if item["kind"] == "text":
-            child.set_tooltip_text(item["text"][:500])
+            tip = item["text"][:500]
+            if item.get("html"):
+                tip = "Ctrl+Enter pastes it with formatting\n\n" + tip
+            child.set_tooltip_text(tip)
         else:
             source = item.get("source", "")
             origin = "copied image" if source == "clipboard" else os.path.basename(source)
@@ -634,17 +650,18 @@ class PickerWindow(Adw.ApplicationWindow):
         dialog.connect("response", lambda _d, r: r == "clear" and self.history.clear_unpinned())
         dialog.present(self)
 
-    def _copy(self, sha, how, paste=True):
+    def _copy(self, sha, paste=True, formatted=False):
         item = self.history.get(sha)
-        log(f"picker: copy via {how} (window active: {self.is_active()})")
         if not item:
             return
-        method = self.app.copy_item(item)
-        if method:
-            self.close()
-            # Pasting goes through the shell extension; the GTK fallback can't.
-            if paste and method == "shell" and self.app.config.get("auto_paste", True):
-                self.app.request_paste()
+        if not self.app.copy_item(item, formatted=formatted):
+            self.toasts.add_toast(Adw.Toast(
+                title="Can't copy: the ShotClip shell extension isn't loaded or is "
+                      "out of date. Log out and back in to finish installing.", timeout=6))
+            return
+        self.close()
+        if paste and self.app.config.get("auto_paste", True):
+            self.app.request_paste()
 
     def _columns(self):
         """Number of cards on the first row of the grid."""
@@ -683,7 +700,7 @@ class PickerWindow(Adw.ApplicationWindow):
     # -- events -------------------------------------------------------------
 
     def _on_child_activated(self, _flow, child):
-        self._copy(child.sha1, "click/activate")
+        self._copy(child.sha1)
 
     def _on_key(self, _ctrl, keyval, _code, state):
         if self.get_visible_dialog():
@@ -695,6 +712,11 @@ class PickerWindow(Adw.ApplicationWindow):
             return True
         if ctrl and state & Gdk.ModifierType.SHIFT_MASK and name in ("Delete", "KP_Delete"):
             self._confirm_clear()
+            return True
+        if ctrl and name in ("Return", "KP_Enter", "ISO_Enter"):
+            sha = self._selected_sha()
+            if sha:
+                self._copy(sha, formatted=True)
             return True
         if state & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.ALT_MASK):
             return False
@@ -718,7 +740,7 @@ class PickerWindow(Adw.ApplicationWindow):
             if sha:
                 # Shift+Enter: copy only, the user pastes with Ctrl+V.
                 shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
-                self._copy(sha, "Shift+Enter" if shift else "Enter", paste=not shift)
+                self._copy(sha, paste=not shift)
             return True
         name = name.removeprefix("KP_")
         if name in ("Left", "Right", "Up", "Down", "Home", "End"):
@@ -728,7 +750,7 @@ class PickerWindow(Adw.ApplicationWindow):
         if len(digit) == 1 and digit in "123456789":
             idx = int(digit) - 1
             if idx < len(self.order):
-                self._copy(self.order[idx]["sha1"], f"key {digit}")
+                self._copy(self.order[idx]["sha1"])
             return True
         if name in ("p", "P"):
             sha = self._selected_sha()
@@ -743,16 +765,8 @@ class PickerWindow(Adw.ApplicationWindow):
         return False
 
     def _on_active_changed(self, *_):
-        log(f"picker: window active = {self.is_active()}")
         if self.is_active():
             self.was_active = True
-            if self.auto_copy and self.order:
-                # --copy-latest: Mutter only accepts a selection from a client
-                # with keyboard focus, so copy once the window is active.
-                self.auto_copy = False
-                latest = max(self.order, key=lambda i: i.get("added", 0))
-                GLib.timeout_add(
-                    150, lambda: self._copy(latest["sha1"], "--copy-latest", paste=False) and False)
         elif self.was_active and not self.closing:
             # Like Win+V: dismiss as soon as the user clicks elsewhere.
             self.close()
@@ -799,11 +813,17 @@ class ShotClipApp(Adw.Application):
         self.add_action(quit_action)
         # Called over D-Bus (org.gtk.Actions.Activate) by the ShotClip GNOME
         # Shell extension, the only thing allowed to see clipboard changes.
+        clip_action = Gio.SimpleAction.new("add-clip", GLib.VariantType.new("a{sv}"))
+        clip_action.connect("activate", self._on_add_clip)
+        self.add_action(clip_action)
+        # Sent by extension version <= 4, still loaded until the next login.
         text_action = Gio.SimpleAction.new("add-text", GLib.VariantType.new("s"))
-        text_action.connect("activate", self._on_add_text)
+        text_action.connect("activate", lambda _a, p: self._add_clip(text=p.get_string()))
         self.add_action(text_action)
         image_action = Gio.SimpleAction.new("add-image", GLib.VariantType.new("(say)"))
-        image_action.connect("activate", self._on_add_image)
+        image_action.connect("activate", lambda _a, p: self._add_clip(
+            mime=p.get_child_value(0).get_string(),
+            image=p.get_child_value(1).get_data_as_bytes().get_data()))
         self.add_action(image_action)
 
     def ensure_running(self):
@@ -817,6 +837,7 @@ class ShotClipApp(Adw.Application):
             log(f"warning: session type is {os.environ.get('XDG_SESSION_TYPE')}, "
                 "ShotClip targets Wayland")
         self.config = load_config()
+        self.config_mtime = self._config_mtime()
         self.history = History(self.config["max_items"])
         first_run = not self.history.exists_on_disk
         self.history.load()
@@ -867,15 +888,9 @@ class ShotClipApp(Adw.Application):
                 cmdline.printerr_literal("shotclip: history is empty\n")
                 return 1
             latest = max(self.history.items, key=lambda i: i.get("added", 0))
-            try:
-                self._copy_via_shell(latest)
-            except (GLib.Error, OSError) as e:
-                # Without the extension a copy needs a focused window.
-                log(f"shell copy unavailable ({getattr(e, 'message', e)}); using picker")
-                self.show_picker(auto_copy=True)
-                cmdline.print_literal("picker opened; newest item is copied once it has focus\n")
-                return 0
-            log(f"copied {latest['sha1'][:10]} to clipboard (via shell)")
+            if not self.copy_item(latest):
+                cmdline.printerr_literal("shotclip: copy failed; is the shell extension loaded?\n")
+                return 1
             cmdline.print_literal(f"copied {latest['sha1'][:10]}\n")
             return 0
         self.show_picker()
@@ -949,59 +964,78 @@ class ShotClipApp(Adw.Application):
             log(f"ignored (not a readable image): {path}")
         return GLib.SOURCE_REMOVE
 
-    def _on_add_text(self, _action, param):
-        if not self.running or not self.config.get("capture_text", True):
-            return
-        text = param.get_string()
-        if self._is_echo(hashlib.sha1(text.encode("utf-8")).hexdigest()):
-            return
-        item = self.history.add_text(text)
-        if item:
-            log(f"added text ({len(item['text'])} chars) -> {item['sha1'][:10]}")
+    def _on_add_clip(self, _action, param):
+        clip = param.unpack()
+        html = clip.get("html")
+        self._add_clip(text=clip.get("text"), html=bytes(html) if html else None,
+                       image=bytes(clip["image"]) if "image" in clip else None,
+                       mime=clip.get("mime"), apps=clip.get("apps", []))
 
-    def _on_add_image(self, _action, param):
+    def _add_clip(self, text=None, html=None, image=None, mime=None, apps=()):
         if not self.running:
             return
-        mime = param.get_child_value(0).get_string()
-        data = param.get_child_value(1).get_data_as_bytes().get_data()
-        if self._is_echo(hashlib.sha1(data).hexdigest()):
+        self._reload_config_if_changed()
+        excluded = set(self.config["exclude_apps"])
+        if excluded & {a.casefold() for a in apps}:
+            log(f"ignored copy from excluded app ({', '.join(apps)})")
             return
-        item = self.history.add_image_bytes(data, mime)
-        if item:
-            log(f"added copied image {item['width']}x{item['height']} -> {item['sha1'][:10]}")
-            self.thumbs.request(item, lambda _t: None)
+        source = f" from {', '.join(apps)}" if apps else ""
+        if text is not None:
+            if not self.config.get("capture_text", True):
+                return
+            if self._is_echo(hashlib.sha1(text.encode("utf-8")).hexdigest()):
+                return
+            item = self.history.add_text(text, decode_html(html) if html else None)
+            if item:
+                fmt = " with formatting" if item.get("html") else ""
+                log(f"added text ({len(text)} chars{fmt}){source} -> {item['sha1'][:10]}")
+        elif image is not None:
+            if self._is_echo(hashlib.sha1(image).hexdigest()):
+                return
+            item = self.history.add_image_bytes(image, mime)
+            if item:
+                log(f"added copied image {item['width']}x{item['height']}{source}"
+                    f" -> {item['sha1'][:10]}")
+                self.thumbs.request(item, lambda _t: None)
 
     def _is_echo(self, sha):
         # While ShotClip replaces the clipboard, GNOME can briefly restore the
         # previous content; don't let that bump an old item to the top.
-        if time.monotonic() < self.echo_guard_until and sha != self.last_copied_sha:
-            log("ignored clipboard echo of previous content")
-            return True
-        return False
+        return time.monotonic() < self.echo_guard_until and sha != self.last_copied_sha
+
+    @staticmethod
+    def _config_mtime():
+        try:
+            return os.stat(CONFIG_FILE).st_mtime
+        except OSError:
+            return None
+
+    def _reload_config_if_changed(self):
+        """Pick up edits to config.json (e.g. exclude_apps) without a restart."""
+        mtime = self._config_mtime()
+        if mtime != self.config_mtime:
+            self.config_mtime = mtime
+            self.config = load_config()
+            self.history.max_items = self.config["max_items"]
+            log("config reloaded")
 
     def _on_history_changed(self):
         self.thumbs.prune({i["sha1"] for i in self.history.items})
 
     # -- clipboard / picker -------------------------------------------------
 
-    def copy_item(self, item):
+    def copy_item(self, item, formatted=False):
+        """Put item on the clipboard through the shell extension. Returns
+        False if the extension isn't available (e.g. not loaded yet)."""
         self.last_copied_sha = item["sha1"]
         self.echo_guard_until = time.monotonic() + 1.0
         try:
-            self._copy_via_shell(item)
-            log(f"copied {item['sha1'][:10]} to clipboard (via shell)")
-            return "shell"
+            self._copy_via_shell(item, formatted)
         except (GLib.Error, OSError) as e:
-            msg = getattr(e, "message", str(e))
-            log(f"shell copy unavailable ({msg}); falling back to GTK clipboard")
-        try:
-            provider = clipboard_provider(item)
-        except GLib.Error as e:
-            log(f"copy failed: {e.message}")
+            log(f"copy failed: {getattr(e, 'message', e)}")
             return False
-        Gdk.Display.get_default().get_clipboard().set_content(provider)
-        log(f"copied {item['sha1'][:10]} to clipboard (via GTK)")
-        return "gtk"
+        log(f"copied {item['sha1'][:10]}{' with formatting' if formatted else ''}")
+        return True
 
     def request_paste(self):
         """Ask the shell extension to paste into the app that regains focus
@@ -1009,21 +1043,25 @@ class ShotClipApp(Adw.Application):
         def done(bus, res):
             try:
                 bus.call_finish(res)
-                log("paste requested")
             except GLib.Error as e:
                 log(f"paste request failed: {e.message}")
         bus = self.get_dbus_connection() or Gio.bus_get_sync(Gio.BusType.SESSION)
         bus.call(SHELL_BUS_NAME, SHELL_HELPER_PATH, SHELL_HELPER_IFACE, "Paste",
                  None, None, Gio.DBusCallFlags.NO_AUTO_START, 3000, None, done)
 
-    def _copy_via_shell(self, item):
+    def _copy_via_shell(self, item, formatted=False):
         """Ask the ShotClip GNOME Shell extension to own the clipboard.
 
         A background client's selection on GNOME Wayland can end up serving
         stale data to apps; a selection owned by the shell itself (like
         Clipboard Indicator uses) pastes reliably and needs no focus.
         """
-        if item["kind"] == "text":
+        if item["kind"] == "text" and item.get("html") and formatted:
+            # HTML only (the shell can offer one format per copy), so this is
+            # opt-in: apps without HTML support would paste nothing.
+            method = "SetHtml"
+            params = GLib.Variant("(ay)", (item["html"].encode("utf-8"),))
+        elif item["kind"] == "text":
             method, params = "SetText", GLib.Variant("(s)", (item["text"],))
         else:
             with open(item["file"], "rb") as f:
@@ -1036,15 +1074,14 @@ class ShotClipApp(Adw.Application):
         bus.call_sync(SHELL_BUS_NAME, SHELL_HELPER_PATH, SHELL_HELPER_IFACE, method,
                       params, None, Gio.DBusCallFlags.NO_AUTO_START, 3000, None)
 
-    def show_picker(self, auto_copy=False):
+    def show_picker(self):
         # Recreate the window every time: a freshly mapped window is much more
         # likely to receive focus on Wayland than a re-presented hidden one.
         if self.window:
             old = self.window
             old.detach()
             old.destroy()
-        self.window = PickerWindow(self, auto_copy=auto_copy)
-        log("picker: shown")
+        self.window = PickerWindow(self)
         self.window.present()
 
 

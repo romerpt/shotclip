@@ -3,5 +3,5 @@
   "name": "ShotClip shell helper",
   "description": "Clipboard helper for ShotClip: forwards copied text to its history, sets the clipboard from the shell and pastes into the focused app. Wayland only lets the shell do these things.",
   "shell-version": ["48", "49", "50"],
-  "version": 4
+  "version": 5
 }

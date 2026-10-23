@@ -1,7 +1,7 @@
 // ShotClip shell helper.
-//  - On every clipboard change, read the text (or, for image-only copies, the
-//    image) and hand it to the ShotClip daemon via its GApplication actions
-//    "add-text" / "add-image" on D-Bus.
+//  - On every clipboard change, read the copy (text, its HTML formatting if
+//    any, or an image for image-only copies) plus the app it came from, and
+//    hand it to the ShotClip daemon via its GApplication action "add-clip".
 //  - Export io.github.shotclip.Shell so the daemon can set the clipboard from
 //    inside the shell (a background client owning the clipboard on GNOME
 //    Wayland is unreliable; a shell-owned selection always pastes), and paste
@@ -11,6 +11,7 @@ import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
+import Shell from 'gi://Shell';
 import St from 'gi://St';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
@@ -22,10 +23,12 @@ const PICKER_APP_ID = 'io.github.shotclip';
 const FOCUS_WAIT_MS = 1000;  // give up pasting if the picker keeps focus this long
 const SETTLE_MS = 60;        // let the input method report the new focus's purpose
 const MAX_CHARS = 100000;
+const MAX_HTML_BYTES = 2 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 32 * 1024 * 1024;
 // Preferred order when a copy offers several image formats.
 const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'image/bmp', 'image/tiff'];
 const TEXT_TYPES = ['text/plain', 'text/plain;charset=utf-8', 'UTF8_STRING', 'STRING', 'TEXT'];
+const HTML_TYPE = 'text/html';
 // Password managers (KeePassXC, ...) mark secrets with this type; never store them.
 const SECRET_HINT = 'x-kde-passwordManagerHint';
 // Files copied in Nautilus also offer text/plain paths; those are not text copies.
@@ -36,6 +39,9 @@ const SHELL_IFACE = `
   <interface name="io.github.shotclip.Shell">
     <method name="SetText">
       <arg type="s" direction="in" name="text"/>
+    </method>
+    <method name="SetHtml">
+      <arg type="ay" direction="in" name="html"/>
     </method>
     <method name="SetContent">
       <arg type="s" direction="in" name="mimetype"/>
@@ -77,6 +83,13 @@ export default class ShotClipExtension extends Extension {
 
     SetText(text) {
         this._clipboard.set_text(St.ClipboardType.CLIPBOARD, text);
+    }
+
+    SetHtml(html) {
+        // HTML only: a shell-owned clipboard offers a single format (GJS can't
+        // implement a multi-format Meta.SelectionSource), so the daemon uses
+        // this only when the user asks for formatting.
+        this._clipboard.set_content(St.ClipboardType.CLIPBOARD, HTML_TYPE, new GLib.Bytes(html));
     }
 
     SetContent(mimetype, data) {
@@ -137,35 +150,59 @@ export default class ShotClipExtension extends Extension {
         const mimes = source.get_mimetypes();
         if (mimes.includes(SECRET_HINT) || mimes.includes(COPIED_FILES))
             return;
+        // Identify the app now: focus may move before the content arrives.
+        const apps = this._focusedAppIds();
         if (mimes.some(m => TEXT_TYPES.includes(m))) {
             // Text wins when both are offered (e.g. a spreadsheet range also
             // offers a rendered image of itself).
-            this._clipboard.get_text(St.ClipboardType.CLIPBOARD, (_cb, text) => this._sendText(text));
+            this._clipboard.get_text(St.ClipboardType.CLIPBOARD, (_cb, text) => {
+                if (!text || !text.trim() || text.length > MAX_CHARS)
+                    return;
+                if (!mimes.includes(HTML_TYPE)) {
+                    this._sendClip({text}, apps);
+                    return;
+                }
+                this._clipboard.get_content(St.ClipboardType.CLIPBOARD, HTML_TYPE,
+                    (_cb2, html) => this._sendClip({text, html}, apps));
+            });
             return;
         }
         const imageType = IMAGE_TYPES.find(t => mimes.includes(t));
         if (imageType) {
             this._clipboard.get_content(St.ClipboardType.CLIPBOARD, imageType,
-                (_cb, bytes) => this._sendImage(imageType, bytes));
+                (_cb, image) => this._sendClip({image, mime: imageType}, apps));
         }
     }
 
-    _sendText(text) {
-        if (!this._clipboard || !text || !text.trim() || text.length > MAX_CHARS)
-            return;
-        this._activate('add-text', new GLib.Variant('s', text));
+    _focusedAppIds() {
+        const win = global.display.focus_window;
+        if (!win)
+            return [];
+        const ids = [win.get_wm_class(), win.get_wm_class_instance(),
+            win.get_gtk_application_id(), win.get_sandboxed_app_id()];
+        const appId = Shell.WindowTracker.get_default().get_window_app(win)?.get_id();
+        if (appId && !appId.startsWith('window:'))  // "window:N" = no .desktop file
+            ids.push(appId.replace(/\.desktop$/, ''));
+        return [...new Set(ids.filter(Boolean))];
     }
 
-    _sendImage(mimetype, bytes) {
-        if (!this._clipboard || !bytes || bytes.get_size() === 0 || bytes.get_size() > MAX_IMAGE_BYTES)
+    _sendClip({text, html, image, mime}, apps) {
+        if (!this._clipboard)
             return;
-        this._activate('add-image', new GLib.Variant('(say)', [mimetype, bytes.toArray()]));
-    }
-
-    _activate(action, parameter) {
+        const clip = {apps: new GLib.Variant('as', apps)};
+        if (text)
+            clip.text = new GLib.Variant('s', text);
+        if (html && html.get_size() > 0 && html.get_size() <= MAX_HTML_BYTES)
+            clip.html = new GLib.Variant('ay', html.toArray());
+        if (image) {
+            if (image.get_size() === 0 || image.get_size() > MAX_IMAGE_BYTES)
+                return;
+            clip.image = new GLib.Variant('ay', image.toArray());
+            clip.mime = new GLib.Variant('s', mime);
+        }
         Gio.DBus.session.call(
             BUS_NAME, OBJECT_PATH, 'org.gtk.Actions', 'Activate',
-            new GLib.Variant('(sava{sv})', [action, [parameter], {}]),
+            new GLib.Variant('(sava{sv})', ['add-clip', [new GLib.Variant('a{sv}', clip)], {}]),
             null, Gio.DBusCallFlags.NO_AUTO_START, -1, null,
             (conn, res) => {
                 try {
