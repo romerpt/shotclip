@@ -38,6 +38,7 @@ Press **Super+V**.
 | P | Pin / unpin (pinned items are never removed) |
 | Del | Remove the item |
 | Ctrl+F | Search text and file names (↑/↓ and Enter work while typing) |
+| Ctrl+, | Preferences (layout, history size, auto-paste, excluded apps) |
 | Ctrl+Shift+Del | Clear all unpinned items (asks first) |
 | Esc, or click elsewhere | Close (closes the search first if it is open) |
 
@@ -69,6 +70,7 @@ made in apps listed in `exclude_apps`.
 | `capture_text` | `true` | Record copied text |
 | `auto_paste` | `true` | Paste after picking (otherwise copy only) |
 | `exclude_apps` | `[]` | Apps whose copies are never recorded, e.g. `["org.keepassxc.KeePassXC", "1password"]` |
+| `layout` | `"list"` | Picker layout: `"list"` (cards), `"compact"` (one line per item) or `"tiles"` (a grid with Images/Text/Pinned filters) |
 
 `exclude_apps` and the other settings apply as soon as the file is saved
 (`max_items` on the next copy). To find an app's id, copy something in it and

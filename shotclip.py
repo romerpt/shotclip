@@ -54,7 +54,9 @@ CONFIG_DIR = os.path.join(GLib.get_user_config_dir(), "shotclip")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
 DEFAULT_CONFIG = {"max_items": 50, "watch_dirs": [], "import_existing": 20,
-                  "capture_text": True, "auto_paste": True, "exclude_apps": []}
+                  "capture_text": True, "auto_paste": True, "exclude_apps": [],
+                  "layout": "list"}
+PICKER_LAYOUTS = ("list", "compact", "tiles")
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp")  # screenshot files to pick up
 # Known translations of GNOME Shell's "Screenshots" folder, used as fallbacks
@@ -71,7 +73,7 @@ SCREENSHOT_DIR_FALLBACKS = (
     "Zrzuty ekranu",
 )
 
-THUMB_W, THUMB_H = 320, 200
+THUMB_W, THUMB_H = 560, 360  # sharp enough for HiDPI list previews
 SETTLE_MS = 400  # wait after a file event before reading the file
 MAX_TEXT_CHARS = 100_000  # larger copies are not kept in the history
 MAX_HTML_CHARS = 500_000  # formatting of larger copies is dropped (text kept)
@@ -149,6 +151,8 @@ def load_config():
     if not isinstance(cfg["exclude_apps"], list):
         cfg["exclude_apps"] = []
     cfg["exclude_apps"] = [str(a).casefold().removesuffix(".desktop") for a in cfg["exclude_apps"]]
+    if cfg["layout"] not in PICKER_LAYOUTS:
+        cfg["layout"] = DEFAULT_CONFIG["layout"]
     return cfg
 
 
@@ -417,30 +421,165 @@ class ThumbCache:
 # --------------------------------------------------------------------------
 
 CSS = """
-.shotclip-card { padding: 6px; border-radius: 12px; }
-.shotclip-thumb { border-radius: 8px; background: alpha(currentColor, 0.06); }
-.shotclip-badge {
-  min-width: 20px; padding: 0 6px; border-radius: 10px; margin: 6px;
-  font-weight: bold; font-size: 0.85em;
-  background: alpha(black, 0.6); color: white;
+/* shared */
+.shotclip-list, .shotclip-compact, .shotclip-tiles { background: none; }
+.shotclip-key {
+  font-size: 0.75em; font-weight: 700; min-width: 18px; min-height: 18px;
+  padding: 0 4px; border-radius: 5px;
+  background: alpha(currentColor, 0.08);
+  box-shadow: inset 0 -1px alpha(currentColor, 0.12);
 }
-.shotclip-actions { margin: 4px; }
-.shotclip-actions button { min-width: 28px; min-height: 28px; padding: 0;
-  background: alpha(black, 0.55); color: white; }
-.shotclip-actions button:hover { background: alpha(black, 0.75); }
-.shotclip-pinned { color: @accent_color; }
-.shotclip-text { padding: 10px 12px; padding-right: 72px; font-size: 0.9em; }
+row:selected .shotclip-key, flowboxchild:selected .shotclip-key {
+  background: @accent_bg_color; color: @accent_fg_color; box-shadow: none;
+}
+.shotclip-meta { font-size: 0.8em; opacity: 0.65; }
+.shotclip-kind { opacity: 0.55; }
+.shotclip-link { color: @accent_color; }
+.shotclip-thumb { border-radius: 8px; background: alpha(currentColor, 0.06); }
+.shotclip-tag {
+  font-size: 0.72em; font-weight: 600; padding: 1px 6px; border-radius: 6px;
+  background: alpha(currentColor, 0.08); opacity: 0.75;
+}
+.shotclip-actions { opacity: 0; transition: opacity 120ms ease-out; }
+row:hover .shotclip-actions, row:selected .shotclip-actions,
+flowboxchild:hover .shotclip-actions, flowboxchild:selected .shotclip-actions { opacity: 1; }
+.shotclip-actions button { min-width: 26px; min-height: 26px; padding: 0; }
+.shotclip-actions button.shotclip-on { color: @accent_color; }
+.shotclip-section { font-size: 0.82em; font-weight: 700; opacity: 0.55;
+  margin: 10px 4px 6px 4px; }
+.shotclip-hints { padding: 6px 12px 8px 12px; }
+.shotclip-hints label { font-size: 0.78em; }
+.shotclip-hints .shotclip-key { font-size: 0.8em; }
+.shotclip-hints .dim-label { margin-right: 8px; }
+
+/* list layout: one card per item */
+.shotclip-list > row {
+  padding: 0; margin: 0 0 6px 0; border-radius: 12px;
+  background: none; outline: none; box-shadow: none;
+}
+.shotclip-list > row:hover, .shotclip-list > row:selected { background: none; }
+.shotclip-card {
+  padding: 10px 12px 8px 12px; border-radius: 12px;
+  background: @card_bg_color;
+  box-shadow: 0 0 0 1px alpha(currentColor, 0.07), 0 1px 2px alpha(black, 0.05);
+  transition: background 120ms ease-out, box-shadow 120ms ease-out;
+}
+.shotclip-list > row:hover .shotclip-card { background: mix(@card_bg_color, currentColor, 0.04); }
+.shotclip-list > row:selected .shotclip-card {
+  background: mix(@card_bg_color, @accent_bg_color, 0.08);
+  box-shadow: 0 0 0 2px @accent_bg_color;
+}
+.shotclip-text { font-size: 0.95em; line-height: 1.3; }
+
+/* compact layout: one line per item */
+.shotclip-compact > row {
+  min-height: 40px; padding: 0 8px; margin: 0 0 2px 0; border-radius: 8px;
+  outline: none; background: none;
+}
+.shotclip-compact > row:hover { background: alpha(currentColor, 0.05); }
+.shotclip-compact > row:selected {
+  background: alpha(@accent_bg_color, 0.10);
+  box-shadow: inset 0 0 0 2px @accent_bg_color;
+}
+.shotclip-compact .shotclip-thumb { border-radius: 4px; }
+.shotclip-compact-icon { min-width: 40px; }
+
+/* tiles layout: a grid */
+.shotclip-tiles > flowboxchild {
+  padding: 0; border-radius: 12px; background: none; outline: none;
+}
+.shotclip-tile {
+  border-radius: 12px; background: @card_bg_color;
+  box-shadow: 0 0 0 1px alpha(currentColor, 0.08);
+}
+.shotclip-tiles > flowboxchild:hover .shotclip-tile {
+  background: mix(@card_bg_color, currentColor, 0.03);
+}
+.shotclip-tiles > flowboxchild:selected .shotclip-tile {
+  box-shadow: 0 0 0 2px @accent_bg_color;
+}
+.shotclip-tile .shotclip-thumb { border-radius: 12px 12px 0 0; }
+.shotclip-tile-text { padding: 12px 14px; /* 24px of TILE_PREVIEW_H */ font-size: 0.95em; line-height: 1.35; }
+.shotclip-tile-footer {
+  padding: 4px 6px 4px 12px; min-height: 30px;
+  border-top: 1px solid alpha(currentColor, 0.07);
+}
 """
 
+LAYOUTS = (("list", "List"), ("compact", "Compact rows"), ("tiles", "Tiles"))
+PREVIEW_H = 112  # height of an image preview in the list layout
+TILE_PREVIEW_H = 132
+TILE_COLUMNS = 3
+WINDOW_SIZES = {"list": (440, 600), "compact": (440, 600), "tiles": (760, 600)}
 
-def format_time(ts):
+
+def format_time(ts, short=False):
     dt = datetime.fromtimestamp(ts)
-    today = datetime.now().date()
+    now = datetime.now()
+    delta = now - dt
+    if timedelta(0) <= delta < timedelta(minutes=1):
+        return "Now" if short else "Just now"
+    if timedelta(0) <= delta < timedelta(hours=1):
+        mins = int(delta.total_seconds() // 60)
+        return f"{mins} min" if short else f"{mins} min ago"
+    today = now.date()
     if dt.date() == today:
-        return f"Today {dt:%H:%M}"
+        return f"{dt:%H:%M}" if short else f"Today {dt:%H:%M}"
     if dt.date() == today - timedelta(days=1):
-        return f"Yesterday {dt:%H:%M}"
+        return "Yesterday" if short else f"Yesterday {dt:%H:%M}"
+    if short:
+        return f"{dt:%d %b}" if dt.year == today.year else f"{dt:%b %Y}"
     return f"{dt:%d %b %Y %H:%M}" if dt.year != today.year else f"{dt:%d %b %H:%M}"
+
+
+def is_url(text):
+    t = text.strip()
+    return "\n" not in t and " " not in t and t.startswith(("http://", "https://", "www."))
+
+
+def text_preview(text, max_lines=3, limit=400):
+    """The first lines of a copied text, without blank lines and indentation."""
+    lines = [ln.strip() for ln in text[:limit * 2].splitlines() if ln.strip()]
+    preview = "\n".join(lines[:max_lines])[:limit]
+    return preview + ("…" if len(lines) > max_lines else "")
+
+
+def one_line(text, limit=200):
+    return "  ".join(ln.strip() for ln in text[:limit * 2].splitlines() if ln.strip())[:limit]
+
+
+class Thumbnail(Gtk.Picture):
+    """A picture of a fixed height (and, optionally, width) that fills its
+    box (cropped), instead of growing with the image's aspect ratio."""
+
+    def __init__(self, height, width=0, **kwargs):
+        super().__init__(content_fit=Gtk.ContentFit.COVER, can_shrink=True,
+                         overflow=Gtk.Overflow.HIDDEN, css_classes=["shotclip-thumb"],
+                         **kwargs)
+        self.fixed_h, self.fixed_w = height, width
+
+    def do_measure(self, orientation, _for_size):
+        size = self.fixed_h if orientation == Gtk.Orientation.VERTICAL else self.fixed_w
+        return size, size, -1, -1
+
+
+class FixedLabel(Gtk.Label):
+    """A label of a fixed height that never asks for more width than it gets
+    (long copies would otherwise make every tile in the grid tall)."""
+
+    def __init__(self, height, **kwargs):
+        super().__init__(**kwargs)
+        self.fixed_h = height
+
+    def do_measure(self, orientation, _for_size):
+        if orientation == Gtk.Orientation.VERTICAL:
+            return self.fixed_h, self.fixed_h, -1, -1
+        return 0, 0, -1, -1
+
+
+def keycap(text):
+    return Gtk.Label(label=text, css_classes=["shotclip-key"],
+                     valign=Gtk.Align.CENTER, halign=Gtk.Align.CENTER)
 
 
 class PickerWindow(Adw.ApplicationWindow):
@@ -448,67 +587,89 @@ class PickerWindow(Adw.ApplicationWindow):
         super().__init__(application=app, title=APP_NAME)
         self.app = app
         self.history = app.history
+        self.layout = app.config.get("layout", "list")
         self.was_active = False
         self.closing = False
-        self.set_default_size(760, 540)
+        self.order = []
+        self.has_pinned = False
+        self.filter = "all"
+        self.set_default_size(*WINDOW_SIZES[self.layout])
         self.set_icon_name("edit-paste")
 
-        self.flow = Gtk.FlowBox(
-            valign=Gtk.Align.START, homogeneous=True,
-            selection_mode=Gtk.SelectionMode.SINGLE,
-            activate_on_single_click=True, max_children_per_line=6,
-            min_children_per_line=2, row_spacing=6, column_spacing=6,
-            margin_top=12, margin_bottom=12, margin_start=12, margin_end=12,
-        )
-        self.flow.connect("child-activated", self._on_child_activated)
+        if self.layout == "tiles":
+            self.container = Gtk.FlowBox(
+                valign=Gtk.Align.START, homogeneous=True,
+                selection_mode=Gtk.SelectionMode.SINGLE, activate_on_single_click=True,
+                min_children_per_line=TILE_COLUMNS, max_children_per_line=TILE_COLUMNS,
+                row_spacing=12, column_spacing=12, css_classes=["shotclip-tiles"])
+            self.container.connect("child-activated", self._on_activated)
+            margins = dict(margin_top=4, margin_bottom=14, margin_start=14, margin_end=14)
+        else:
+            self.container = Gtk.ListBox(
+                selection_mode=Gtk.SelectionMode.SINGLE, activate_on_single_click=True,
+                valign=Gtk.Align.START,
+                css_classes=["shotclip-compact" if self.layout == "compact" else "shotclip-list"])
+            self.container.connect("row-activated", self._on_activated)
+            self.container.set_header_func(self._section_header)
+            margins = (dict(margin_top=0, margin_bottom=8, margin_start=8, margin_end=8)
+                       if self.layout == "compact" else
+                       dict(margin_top=4, margin_bottom=8, margin_start=12, margin_end=12))
 
-        scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, vexpand=True)
-        scroller.set_child(self.flow)
-        # Keep the keyboard selection scrolled into view.
-        self.flow.set_vadjustment(scroller.get_vadjustment())
+        self.scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER,
+                                           vexpand=True)
+        clamp = Adw.Clamp(maximum_size=1200 if self.layout == "tiles" else 720,
+                          child=self.container, **margins)
+        self.scroller.set_child(clamp)
 
         self.empty = Adw.StatusPage(
-            icon_name="edit-paste-symbolic", title="Nothing here yet",
-            description="Take a screenshot (Print Screen) or copy some text.",
+            icon_name="edit-paste-symbolic", title="Nothing copied yet",
+            description="Copy some text or take a screenshot, and it shows up here.",
+            css_classes=["compact"],
         )
-        self.no_match = Adw.StatusPage(icon_name="system-search-symbolic",
-                                       title="No matches")
-        self.stack = Gtk.Stack()
-        self.stack.add_named(scroller, "grid")
+        self.no_match = Adw.StatusPage(
+            icon_name="system-search-symbolic", title="No matches",
+            description="Try a different word, or press Esc to see everything.",
+            css_classes=["compact"])
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE,
+                               transition_duration=120)
+        self.stack.add_named(self.scroller, "list")
         self.stack.add_named(self.empty, "empty")
         self.stack.add_named(self.no_match, "no-match")
 
-        header = Adw.HeaderBar()
-        self.subtitle = Adw.WindowTitle(title="Clipboard history")
-        header.set_title_widget(self.subtitle)
+        header = Adw.HeaderBar(css_classes=["flat"])
+        self.subtitle = Adw.WindowTitle(title="Clipboard")
+        if self.layout == "tiles":
+            header.set_title_widget(self._make_filters())
+        else:
+            header.set_title_widget(self.subtitle)
         search_toggle = Gtk.ToggleButton(icon_name="system-search-symbolic",
                                          tooltip_text="Search (Ctrl+F)")
         header.pack_start(search_toggle)
+        prefs = Gtk.Button(icon_name="emblem-system-symbolic",
+                           tooltip_text="Preferences (Ctrl+,)")
+        prefs.connect("clicked", lambda *_: self._show_preferences())
+        header.pack_end(prefs)
         clear = Gtk.Button(icon_name="edit-clear-all-symbolic",
-                           tooltip_text="Clear all unpinned (Ctrl+Shift+Del)")
+                           tooltip_text="Clear unpinned items (Ctrl+Shift+Del)")
         clear.connect("clicked", lambda *_: self._confirm_clear())
         header.pack_end(clear)
 
         self.search_entry = Gtk.SearchEntry(placeholder_text="Search text and file names",
                                             hexpand=True)
         self.search_entry.connect("search-changed", lambda *_: self.refresh())
-        self.search_bar = Gtk.SearchBar(child=self.search_entry, show_close_button=True)
+        self.search_bar = Gtk.SearchBar(child=self.search_entry)
         self.search_bar.connect_entry(self.search_entry)
         search_toggle.bind_property(
             "active", self.search_bar, "search-mode-enabled",
             GObject.BindingFlags.BIDIRECTIONAL | GObject.BindingFlags.SYNC_CREATE)
-
-        hint = Gtk.Label(
-            label="Enter/click paste · Shift+Enter copy only · 1–9 quick paste · "
-                  "Ctrl+Enter with formatting · P pin · Del remove · Ctrl+F search · Esc close",
-            css_classes=["dim-label", "caption"], margin_top=6, margin_bottom=8,
-            wrap=True, justify=Gtk.Justification.CENTER,
-        )
+        if self.layout == "compact":
+            # Compact rows keep the search field in view; Ctrl+F focuses it.
+            self.search_bar.set_search_mode(True)
 
         view = Adw.ToolbarView(content=self.stack)
         view.add_top_bar(header)
         view.add_top_bar(self.search_bar)
-        view.add_bottom_bar(hint)
+        view.add_bottom_bar(self._make_hints())
         self.toasts = Adw.ToastOverlay(child=view)
         self.set_content(self.toasts)
 
@@ -524,32 +685,83 @@ class PickerWindow(Adw.ApplicationWindow):
 
     # -- building -----------------------------------------------------------
 
+    @staticmethod
+    def _make_hints():
+        box = Gtk.Box(spacing=4, halign=Gtk.Align.CENTER, css_classes=["shotclip-hints"])
+        for key, what in (("↵", "Paste"), ("⇧↵", "Copy"), ("1–9", "Quick paste"),
+                          ("P", "Pin"), ("Del", "Remove")):
+            box.append(keycap(key))
+            box.append(Gtk.Label(label=what, css_classes=["dim-label"]))
+        box.set_tooltip_text(
+            "Enter or click: paste\nShift+Enter: copy only\n1–9: paste that item\n"
+            "Ctrl+Enter: paste with formatting\nP: pin or unpin\nDel: remove\n"
+            "Ctrl+F: search\nCtrl+,: preferences\nCtrl+Shift+Del: clear unpinned\nEsc: close")
+        return box
+
+    def _make_filters(self):
+        box = Gtk.Box(css_classes=["linked"], valign=Gtk.Align.CENTER)
+        first = None
+        for key, label in (("all", "All"), ("image", "Images"), ("text", "Text"),
+                           ("pinned", "Pinned")):
+            btn = Gtk.ToggleButton(label=label, can_focus=False, active=key == "all")
+            if first:
+                btn.set_group(first)
+            else:
+                first = btn
+            btn.connect("toggled", self._on_filter_toggled, key)
+            box.append(btn)
+        return box
+
+    def _on_filter_toggled(self, btn, key):
+        if btn.get_active() and self.filter != key:
+            self.filter = key
+            self.refresh()
+
     def refresh(self):
         selected = self._selected_sha()
-        self.flow.remove_all()
+        self.container.remove_all()
         everything = self.history.ordered()
         query = self.search_entry.get_text().strip().casefold()
         self.order = [i for i in everything if self._matches(i, query)]
-        if query:
-            self.subtitle.set_subtitle(f"{len(self.order)} of {len(everything)} item(s)")
+        n = len(everything)
+        if query or self.filter != "all":
+            self.subtitle.set_subtitle(f"{len(self.order)} of {n} items")
         else:
-            self.subtitle.set_subtitle(f"{len(everything)} item(s)")
-        page = "grid" if self.order else ("no-match" if everything else "empty")
+            self.subtitle.set_subtitle("1 item" if n == 1 else f"{n} items")
+        page = "list" if self.order else ("no-match" if everything else "empty")
         self.stack.set_visible_child_name(page)
+        self.has_pinned = any(i.get("pinned") for i in self.order)
+        make = {"list": self._make_card, "compact": self._make_compact_row,
+                "tiles": self._make_tile}[self.layout]
         target = None
         for idx, item in enumerate(self.order):
-            child = self._make_card(item, idx)
-            self.flow.append(child)
+            child = make(item, idx)
+            self.container.append(child)
             if item["sha1"] == selected:
                 target = child
         if self.order:
-            target = target or self.flow.get_child_at_index(0)
-            self.flow.select_child(target)
+            target = target or self._child(0)
+            self._select(target)
             if not self._search_has_focus():
                 target.grab_focus()
 
-    @staticmethod
-    def _matches(item, query):
+    def _section_header(self, row, before):
+        if not self.has_pinned:
+            row.set_header(None)
+            return
+        title = None
+        if before is None:
+            title = "Pinned" if row.pinned else "Recent"
+        elif before.pinned and not row.pinned:
+            title = "Recent"
+        row.set_header(Gtk.Label(label=title, xalign=0, css_classes=["shotclip-section"])
+                       if title else None)
+
+    def _matches(self, item, query):
+        if self.filter == "pinned" and not item.get("pinned"):
+            return False
+        if self.filter in ("image", "text") and item["kind"] != self.filter:
+            return False
         if not query:
             return True
         if item["kind"] == "text":
@@ -557,80 +769,154 @@ class PickerWindow(Adw.ApplicationWindow):
         name = os.path.basename(item.get("source", ""))
         return query in f"{name} image screenshot".casefold()
 
-    def _make_card(self, item, idx):
+    def _actions(self, item):
         sha = item["sha1"]
-        if item["kind"] == "text":
-            preview = Gtk.Label(
-                label=item["text"][:400].strip(), wrap=True, lines=5,
-                wrap_mode=Pango.WrapMode.WORD_CHAR, ellipsize=Pango.EllipsizeMode.END,
-                xalign=0, yalign=0, max_width_chars=1, hexpand=True,
-                css_classes=["shotclip-text"],
-            )
-            content = Gtk.Box(width_request=200, height_request=125,
-                              css_classes=["shotclip-thumb"])
-            content.append(preview)
-        else:
-            content = Gtk.Picture(
-                content_fit=Gtk.ContentFit.CONTAIN, can_shrink=True,
-                width_request=200, height_request=125, css_classes=["shotclip-thumb"],
-            )
-            self.app.thumbs.request(
-                item, lambda tex, p=content: tex and p.set_paintable(tex))
-
-        overlay = Gtk.Overlay(child=content)
-        if idx < 9:
-            overlay.add_overlay(Gtk.Label(
-                label=str(idx + 1), halign=Gtk.Align.START, valign=Gtk.Align.START,
-                css_classes=["shotclip-badge"],
-            ))
-
-        actions = Gtk.Box(spacing=4, halign=Gtk.Align.END, valign=Gtk.Align.START,
-                          css_classes=["shotclip-actions"])
+        pinned = bool(item.get("pinned"))
+        actions = Gtk.Box(spacing=2, css_classes=["shotclip-actions"], valign=Gtk.Align.CENTER)
         pin = Gtk.Button(
             icon_name="view-pin-symbolic", focus_on_click=False, can_focus=False,
-            tooltip_text="Unpin (P)" if item.get("pinned") else "Pin (P)",
-            css_classes=["circular"] + (["shotclip-pinned"] if item.get("pinned") else []),
-        )
+            tooltip_text="Unpin (P)" if pinned else "Pin (P)",
+            css_classes=["flat", "circular"] + (["shotclip-on"] if pinned else []))
         pin.connect("clicked", lambda *_: self.history.toggle_pin(sha))
         rm = Gtk.Button(icon_name="user-trash-symbolic", focus_on_click=False,
-                        can_focus=False, tooltip_text="Remove (Del)", css_classes=["circular"])
+                        can_focus=False, tooltip_text="Remove (Del)",
+                        css_classes=["flat", "circular"])
         rm.connect("clicked", lambda *_: self.history.remove(sha))
         actions.append(pin)
         actions.append(rm)
-        overlay.add_overlay(actions)
+        return actions
 
-        label_text = format_time(item.get("added", 0))
-        if item["kind"] == "text":
-            label_text += f" · {len(item['text'])} chars"
-            if item.get("html"):
-                label_text += " · formatted"
-        if item.get("pinned"):
-            label_text = "📌 " + label_text
-        caption = Gtk.Label(label=label_text, css_classes=["caption"], margin_top=4,
-                            ellipsize=Pango.EllipsizeMode.END)
+    @staticmethod
+    def _kind_icon(item):
+        if item["kind"] != "text":
+            return "image-x-generic-symbolic"
+        return "insert-link-symbolic" if is_url(item["text"]) else "text-x-generic-symbolic"
 
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["shotclip-card"])
-        box.append(overlay)
-        box.append(caption)
-        child = Gtk.FlowBoxChild(child=box)
-        child.sha1 = sha
+    def _finish(self, child, item, idx):
+        child.sha1 = item["sha1"]
+        child.pinned = bool(item.get("pinned"))
         if item["kind"] == "text":
-            tip = item["text"][:500]
-            if item.get("html"):
-                tip = "Ctrl+Enter pastes it with formatting\n\n" + tip
-            child.set_tooltip_text(tip)
+            child.set_tooltip_text(item["text"][:500])
         else:
             source = item.get("source", "")
-            origin = "copied image" if source == "clipboard" else os.path.basename(source)
+            origin = "Copied image" if source == "clipboard" else os.path.basename(source)
             child.set_tooltip_text(
-                f"{item.get('width', '?')}×{item.get('height', '?')}  {origin}")
+                f"{origin}\n{item.get('width', '?')} × {item.get('height', '?')}")
         return child
+
+    def _thumb(self, item, height, width=0, **kwargs):
+        pic = Thumbnail(height, width, **kwargs)
+        self.app.thumbs.request(item, lambda tex, p=pic: tex and p.set_paintable(tex))
+        return pic
+
+    def _make_card(self, item, idx):
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
+                       css_classes=["shotclip-card"])
+        if item["kind"] == "text":
+            link = is_url(item["text"])
+            card.append(Gtk.Label(
+                label=text_preview(item["text"]), wrap=True, lines=1 if link else 3,
+                wrap_mode=Pango.WrapMode.WORD_CHAR,
+                ellipsize=Pango.EllipsizeMode.MIDDLE if link else Pango.EllipsizeMode.END,
+                xalign=0, yalign=0, max_width_chars=1, hexpand=True,
+                css_classes=["shotclip-text"] + (["shotclip-link"] if link else []),
+            ))
+            meta = format_time(item.get("added", 0))
+        else:
+            card.append(self._thumb(item, PREVIEW_H, hexpand=True))
+            meta = f"{format_time(item.get('added', 0))}   " \
+                   f"{item.get('width', '?')} × {item.get('height', '?')}"
+
+        footer = Gtk.Box(spacing=6)
+        footer.append(Gtk.Image(icon_name=self._kind_icon(item), pixel_size=14,
+                                css_classes=["shotclip-kind"]))
+        footer.append(Gtk.Label(label=meta, xalign=0, hexpand=True,
+                                ellipsize=Pango.EllipsizeMode.END,
+                                css_classes=["shotclip-meta"]))
+        if item.get("html"):
+            footer.append(Gtk.Label(label="Formatted", valign=Gtk.Align.CENTER,
+                                    tooltip_text="Ctrl+Enter pastes it with formatting",
+                                    css_classes=["shotclip-tag"]))
+        footer.append(self._actions(item))
+        if idx < 9:
+            footer.append(keycap(str(idx + 1)))
+        card.append(footer)
+        return self._finish(Gtk.ListBoxRow(child=card), item, idx)
+
+    def _make_compact_row(self, item, idx):
+        box = Gtk.Box(spacing=10)
+        if item["kind"] == "text":
+            box.append(Gtk.Image(icon_name=self._kind_icon(item), pixel_size=16,
+                                 css_classes=["shotclip-kind", "shotclip-compact-icon"]))
+            link = is_url(item["text"])
+            text = one_line(item["text"])
+            classes = ["shotclip-link"] if link else []
+        else:
+            box.append(self._thumb(item, 26, 40, valign=Gtk.Align.CENTER))
+            source = item.get("source", "")
+            name = "Copied image" if source == "clipboard" else "Screenshot"
+            text = f"{name}  {item.get('width', '?')} × {item.get('height', '?')}"
+            link, classes = False, ["dim-label"]
+        box.append(Gtk.Label(
+            label=text, xalign=0, hexpand=True, max_width_chars=1, css_classes=classes,
+            ellipsize=Pango.EllipsizeMode.MIDDLE if link else Pango.EllipsizeMode.END))
+        box.append(self._actions(item))
+        box.append(Gtk.Label(label=format_time(item.get("added", 0), short=True),
+                             css_classes=["shotclip-meta"]))
+        key = keycap(str(idx + 1) if idx < 9 else "")
+        key.set_opacity(1 if idx < 9 else 0)
+        box.append(key)
+        return self._finish(Gtk.ListBoxRow(child=box), item, idx)
+
+    def _make_tile(self, item, idx):
+        tile = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["shotclip-tile"],
+                       overflow=Gtk.Overflow.HIDDEN)
+        if item["kind"] == "text":
+            link = is_url(item["text"])
+            tile.append(FixedLabel(
+                TILE_PREVIEW_H - 24, label=text_preview(item["text"], max_lines=6), wrap=True,
+                lines=5, wrap_mode=Pango.WrapMode.WORD_CHAR, ellipsize=Pango.EllipsizeMode.END,
+                xalign=0, yalign=0, hexpand=True,
+                css_classes=["shotclip-tile-text"] + (["shotclip-link"] if link else [])))
+        else:
+            tile.append(self._thumb(item, TILE_PREVIEW_H, hexpand=True))
+        footer = Gtk.Box(spacing=6, css_classes=["shotclip-tile-footer"])
+        meta = "Pinned" if item.get("pinned") else format_time(item.get("added", 0))
+        footer.append(Gtk.Label(label=meta, xalign=0, hexpand=True,
+                                ellipsize=Pango.EllipsizeMode.END,
+                                css_classes=["shotclip-meta"]))
+        footer.append(self._actions(item))
+        if idx < 9:
+            footer.append(keycap(str(idx + 1)))
+        tile.append(footer)
+        return self._finish(Gtk.FlowBoxChild(child=tile), item, idx)
+
+    # -- container helpers (list box or flow box) ---------------------------
+
+    def _child(self, idx):
+        if self.layout == "tiles":
+            return self.container.get_child_at_index(idx)
+        return self.container.get_row_at_index(idx)
+
+    def _select(self, child):
+        if self.layout == "tiles":
+            self.container.select_child(child)
+        else:
+            self.container.select_row(child)
+
+    def _selected_child(self):
+        if not hasattr(self, "container"):
+            return None
+        if self.layout == "tiles":
+            sel = self.container.get_selected_children()
+            return sel[0] if sel else None
+        return self.container.get_selected_row()
 
     # -- helpers ------------------------------------------------------------
 
     def _selected_sha(self):
-        sel = self.flow.get_selected_children() if hasattr(self, "order") else []
-        return sel[0].sha1 if sel else None
+        child = self._selected_child()
+        return child.sha1 if child else None
 
     def _search_has_focus(self):
         focus = self.get_focus()
@@ -650,6 +936,9 @@ class PickerWindow(Adw.ApplicationWindow):
         dialog.connect("response", lambda _d, r: r == "clear" and self.history.clear_unpinned())
         dialog.present(self)
 
+    def _show_preferences(self):
+        PreferencesDialog(self.app).present(self)
+
     def _copy(self, sha, paste=True, formatted=False):
         item = self.history.get(sha)
         if not item:
@@ -663,52 +952,64 @@ class PickerWindow(Adw.ApplicationWindow):
         if paste and self.app.config.get("auto_paste", True):
             self.app.request_paste()
 
-    def _columns(self):
-        """Number of cards on the first row of the grid."""
-        first_y, n = None, 0
-        for i in range(len(self.order)):
-            ok, rect = self.flow.get_child_at_index(i).compute_bounds(self.flow)
-            if not ok:
-                break
-            if first_y is None:
-                first_y = rect.origin.y
-            elif abs(rect.origin.y - first_y) > 1:
-                break
-            n += 1
-        return max(1, n)
+    def _scroll_to(self, child):
+        ok, rect = child.compute_bounds(self.container)
+        if not ok:
+            return
+        adj = self.scroller.get_vadjustment()
+        top, bottom = rect.origin.y, rect.origin.y + rect.size.height
+        if top < adj.get_value():
+            adj.set_value(max(0, top - 8))
+        elif bottom > adj.get_value() + adj.get_page_size():
+            adj.set_value(bottom - adj.get_page_size() + 8)
 
     def _move(self, name, focus=True):
         if not self.order:
             return
-        sel = self.flow.get_selected_children()
-        idx = sel[0].get_index() if sel else 0
-        cols = self._columns()
-        step = {"Left": -1, "Right": 1, "Up": -cols, "Down": cols}
+        child = self._selected_child()
+        idx = child.get_index() if child else 0
+        last = len(self.order) - 1
+        if self.layout == "tiles":
+            cols, page = TILE_COLUMNS, TILE_COLUMNS * 3
+            steps = {"Left": -1, "Right": 1, "Up": -cols, "Down": cols,
+                     "Page_Up": -page, "Page_Down": page}
+        else:
+            steps = {"Left": -1, "Right": 1, "Up": -1, "Down": 1,
+                     "Page_Up": -5, "Page_Down": 5}
         if name == "Home":
             idx = 0
         elif name == "End":
-            idx = len(self.order) - 1
-        else:
-            new = idx + step[name]
-            if 0 <= new < len(self.order):
+            idx = last
+        elif self.layout == "tiles" and name in ("Left", "Right", "Up", "Down"):
+            new = idx + steps[name]
+            if 0 <= new <= last:
                 idx = new
-        child = self.flow.get_child_at_index(idx)
-        self.flow.select_child(child)
+        else:
+            idx = min(last, max(0, idx + steps[name]))
+        child = self._child(idx)
+        self._select(child)
         if focus:
             child.grab_focus()
+        self._scroll_to(child)
 
     # -- events -------------------------------------------------------------
 
-    def _on_child_activated(self, _flow, child):
+    def _on_activated(self, _container, child):
         self._copy(child.sha1)
 
     def _on_key(self, _ctrl, keyval, _code, state):
         if self.get_visible_dialog():
-            return False  # let the Clear dialog handle its own keys
+            return False  # let the Clear and Preferences dialogs handle their keys
         name = Gdk.keyval_name(keyval) or ""
         ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
         if ctrl and name in ("f", "F"):
-            self.search_bar.set_search_mode(not self.search_bar.get_search_mode())
+            if self.layout == "compact":
+                self.search_entry.grab_focus()
+            else:
+                self.search_bar.set_search_mode(not self.search_bar.get_search_mode())
+            return True
+        if ctrl and name == "comma":
+            self._show_preferences()
             return True
         if ctrl and state & Gdk.ModifierType.SHIFT_MASK and name in ("Delete", "KP_Delete"):
             self._confirm_clear()
@@ -722,16 +1023,19 @@ class PickerWindow(Adw.ApplicationWindow):
             return False
         searching = self._search_has_focus()
         if name == "Escape":
-            if self.search_bar.get_search_mode():
+            if self.layout == "compact" and (searching or self.search_entry.get_text()):
+                self.search_entry.set_text("")
+                self._move("Home")
+            elif self.layout != "compact" and self.search_bar.get_search_mode():
                 self.search_bar.set_search_mode(False)  # also clears the query
                 self._move("Home")
             else:
                 self.close()
             return True
         if searching:
-            # Typing goes to the search field; only these keys act on the grid.
+            # Typing goes to the search field; only these keys act on the items.
             if name in ("Up", "Down", "KP_Up", "KP_Down", "Page_Up", "Page_Down"):
-                self._move("Up" if "Up" in name else "Down", focus=False)
+                self._move(name.removeprefix("KP_"), focus=False)
                 return True
             if name not in ("Return", "KP_Enter", "ISO_Enter"):
                 return False
@@ -743,12 +1047,11 @@ class PickerWindow(Adw.ApplicationWindow):
                 self._copy(sha, paste=not shift)
             return True
         name = name.removeprefix("KP_")
-        if name in ("Left", "Right", "Up", "Down", "Home", "End"):
+        if name in ("Left", "Right", "Up", "Down", "Home", "End", "Page_Up", "Page_Down"):
             self._move(name)
             return True
-        digit = name[-1] if name.startswith("KP_") else name
-        if len(digit) == 1 and digit in "123456789":
-            idx = int(digit) - 1
+        if len(name) == 1 and name in "123456789":
+            idx = int(name) - 1
             if idx < len(self.order):
                 self._copy(self.order[idx]["sha1"])
             return True
@@ -781,6 +1084,104 @@ class PickerWindow(Adw.ApplicationWindow):
             self.history.listeners.remove(self._listener)
         if self.app.window is self:
             self.app.window = None
+
+
+class PreferencesDialog(Adw.PreferencesDialog):
+    """Edits config.json; the picker reopens in the new layout on close."""
+
+    def __init__(self, app):
+        super().__init__(title="Preferences", search_enabled=False)
+        self.app = app
+        self.cfg = dict(app.config)
+        self.start_layout = self.cfg.get("layout", "list")
+        page = Adw.PreferencesPage()
+        self.add(page)
+
+        look = Adw.PreferencesGroup(title="Appearance")
+        names = Gtk.StringList.new([label for _key, label in LAYOUTS])
+        self.layout_row = Adw.ComboRow(
+            title="Layout", subtitle="How items are shown in the picker", model=names,
+            selected=[k for k, _l in LAYOUTS].index(self.start_layout))
+        self.layout_row.connect("notify::selected", self._on_layout)
+        look.add(self.layout_row)
+        page.add(look)
+
+        hist = Adw.PreferencesGroup(title="History")
+        keep = Adw.SpinRow.new_with_range(1, 1000, 1)
+        keep.set_title("Items to keep")
+        keep.set_subtitle("Pinned items don't count")
+        keep.set_value(self.cfg["max_items"])
+        keep.connect("notify::value",
+                     lambda r, _p: self._set("max_items", int(r.get_value())))
+        hist.add(keep)
+        hist.add(self._switch("capture_text", "Keep copied text",
+                              "Off: only screenshots and images are kept"))
+        page.add(hist)
+
+        pick = Adw.PreferencesGroup(title="Picking an item")
+        pick.add(self._switch("auto_paste", "Paste right away",
+                              "Off: the item is only copied, paste it with Ctrl+V"))
+        page.add(pick)
+
+        self.excl = Adw.PreferencesGroup(
+            title="Never record copies from",
+            description="App ids, as shown in the log (journalctl --user -t shotclip)")
+        self.add_entry = Adw.EntryRow(title="Add an app id, then press Enter",
+                                      show_apply_button=True)
+        self.add_entry.connect("apply", self._on_add_app)
+        self.excl.add(self.add_entry)
+        self.app_rows = []
+        self._fill_apps()
+        page.add(self.excl)
+
+        folders = Adw.PreferencesGroup(title="Screenshot folders")
+        for d in getattr(app, "watch_dirs", []):
+            folders.add(Adw.ActionRow(title=d.replace(os.path.expanduser("~"), "~", 1),
+                                      subtitle="Set watch_dirs in config.json to change"))
+        page.add(folders)
+
+        self.connect("closed", self._on_closed)
+
+    def _switch(self, key, title, subtitle):
+        row = Adw.SwitchRow(title=title, subtitle=subtitle, active=bool(self.cfg[key]))
+        row.connect("notify::active", lambda r, _p: self._set(key, r.get_active()))
+        return row
+
+    def _fill_apps(self):
+        for row in self.app_rows:
+            self.excl.remove(row)
+        self.app_rows = []
+        for app_id in self.cfg["exclude_apps"]:
+            row = Adw.ActionRow(title=app_id)
+            rm = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER,
+                            tooltip_text=f"Stop excluding {app_id}", css_classes=["flat"])
+            rm.connect("clicked", lambda _b, a=app_id: self._set(
+                "exclude_apps", [x for x in self.cfg["exclude_apps"] if x != a]) or self._fill_apps())
+            row.add_suffix(rm)
+            self.excl.add(row)
+            self.app_rows.append(row)
+
+    def _on_add_app(self, entry):
+        app_id = entry.get_text().strip().casefold().removesuffix(".desktop")
+        entry.set_text("")
+        if app_id and app_id not in self.cfg["exclude_apps"]:
+            self._set("exclude_apps", self.cfg["exclude_apps"] + [app_id])
+            self._fill_apps()
+
+    def _on_layout(self, row, _pspec):
+        self._set("layout", LAYOUTS[row.get_selected()][0])
+
+    def _set(self, key, value):
+        self.cfg[key] = value
+        self.app.save_config(self.cfg)
+
+    def _on_closed(self, *_):
+        before = len(self.app.history.items)
+        self.app.history.trim()
+        if len(self.app.history.items) != before:
+            self.app.history.changed()
+        if self.app.config.get("layout") != self.start_layout and self.app.window:
+            GLib.idle_add(lambda: self.app.show_picker() and False)
 
 
 # --------------------------------------------------------------------------
@@ -1018,6 +1419,15 @@ class ShotClipApp(Adw.Application):
             self.config = load_config()
             self.history.max_items = self.config["max_items"]
             log("config reloaded")
+
+    def save_config(self, cfg):
+        """Write cfg (from the Preferences dialog) and apply it right away."""
+        atomic_write_json(CONFIG_FILE, {k: cfg[k] for k in DEFAULT_CONFIG})
+        self.config_mtime = self._config_mtime()
+        self.config = load_config()
+        # Not trimmed yet: the Preferences dialog trims once it closes, so
+        # stepping the number down doesn't delete items along the way.
+        self.history.max_items = self.config["max_items"]
 
     def _on_history_changed(self):
         self.thumbs.prune({i["sha1"] for i in self.history.items})
