@@ -7,6 +7,7 @@ APP_ID="io.github.shotclip"
 BIN="$HOME/.local/bin/shotclip"
 DESKTOP="$HOME/.local/share/applications/$APP_ID.desktop"
 AUTOSTART="$HOME/.config/autostart/$APP_ID.desktop"
+ICON="$HOME/.local/share/icons/hicolor/scalable/apps/$APP_ID.svg"
 STATE_DIR="$HOME/.local/state/shotclip"
 LOGS="journalctl --user -t shotclip"
 SAVED_TRAY="$STATE_DIR/toggle-message-tray.orig"
@@ -67,6 +68,8 @@ fi
 # 3. Binary --------------------------------------------------------------------
 say "Installing $BIN"
 install -Dm755 "$SRC_DIR/shotclip.py" "$BIN"
+install -Dm644 "$SRC_DIR/data/$APP_ID.svg" "$ICON"
+gtk-update-icon-cache -q "$HOME/.local/share/icons/hicolor" >/dev/null 2>&1 || true
 
 # 4. Desktop entry + autostart -------------------------------------------------
 say "Writing desktop entries"
@@ -77,7 +80,7 @@ Type=Application
 Name=ShotClip
 Comment=Screenshot clipboard history
 Exec=$BIN
-Icon=edit-paste
+Icon=$APP_ID
 Terminal=false
 Categories=Utility;
 StartupNotify=true
@@ -88,7 +91,7 @@ Type=Application
 Name=ShotClip (daemon)
 Comment=Screenshot clipboard history daemon
 Exec=systemd-cat -t shotclip $BIN --daemon
-Icon=edit-paste
+Icon=$APP_ID
 Terminal=false
 NoDisplay=true
 X-GNOME-Autostart-enabled=true

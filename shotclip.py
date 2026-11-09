@@ -10,6 +10,10 @@ Usage:
   shotclip --daemon     start hidden and stay resident
   shotclip --quit       stop the running instance
   shotclip --copy-latest  (debug) copy the newest item to the clipboard
+  shotclip --setup      turn on Super+V and the shell extension for this user
+                        (done automatically the first time the daemon runs)
+  shotclip --remove-setup  undo --setup (used when the package is removed)
+  shotclip --version    print the version
 
 In the picker, Enter/click/1-9 copy and paste into the previous app (set
 "auto_paste": false in the config to only copy); Shift+Enter only copies;
@@ -41,6 +45,7 @@ from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, GObject, Gtk, Pango  #
 
 APP_ID = "io.github.shotclip"
 APP_NAME = "ShotClip"
+VERSION = "1.0.0"
 
 # D-Bus object exported by the ShotClip GNOME Shell extension (extension/).
 SHELL_BUS_NAME = "org.gnome.Shell"
@@ -52,6 +57,13 @@ IMAGES_DIR = os.path.join(DATA_DIR, "images")
 HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
 CONFIG_DIR = os.path.join(GLib.get_user_config_dir(), "shotclip")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+
+STATE_DIR = os.path.join(GLib.get_user_state_dir(), "shotclip")
+SETUP_MARK = os.path.join(STATE_DIR, "setup-done")
+SAVED_TRAY = os.path.join(STATE_DIR, "toggle-message-tray.orig")  # shared with install.sh
+MEDIA_KEYS = "org.gnome.settings-daemon.plugins.media-keys"
+KB_PATH = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/shotclip/"
+EXT_UUID = "shotclip@shotclip.github.io"
 
 DEFAULT_CONFIG = {"max_items": 50, "watch_dirs": [], "import_existing": 20,
                   "capture_text": True, "auto_paste": True, "exclude_apps": [],
@@ -177,6 +189,86 @@ def detect_screenshot_dirs(cfg):
         os.makedirs(path, exist_ok=True)
         found.append(path)
     return found
+
+
+# --------------------------------------------------------------------------
+# Per-user desktop setup (Super+V and the shell extension)
+# --------------------------------------------------------------------------
+
+def _settings(schema_id, path=None):
+    source = Gio.SettingsSchemaSource.get_default()
+    schema = source.lookup(schema_id, True) if source else None
+    if schema is None:
+        return None
+    return Gio.Settings.new_full(schema, None, path)
+
+
+def desktop_setup(command):
+    """Bind Super+V to command, move GNOME's notification list to Super+M and
+    enable the ShotClip shell extension. Safe to run more than once."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    shell_keys = _settings("org.gnome.shell.keybindings")
+    if shell_keys:
+        tray = shell_keys.get_strv("toggle-message-tray")
+        if tray != ["<Super>m"]:
+            if not os.path.exists(SAVED_TRAY):
+                with open(SAVED_TRAY, "w", encoding="utf-8") as f:
+                    f.write(GLib.Variant("as", tray).print_(False) + "\n")
+            shell_keys.set_strv("toggle-message-tray", ["<Super>m"])
+    media = _settings(MEDIA_KEYS)
+    custom = _settings(MEDIA_KEYS + ".custom-keybinding", KB_PATH)
+    if media and custom:
+        paths = media.get_strv("custom-keybindings")
+        if KB_PATH not in paths:
+            media.set_strv("custom-keybindings", paths + [KB_PATH])
+        custom.set_string("name", APP_NAME)
+        custom.set_string("command", command)
+        custom.set_string("binding", "<Super>v")
+    shell = _settings("org.gnome.shell")
+    if shell:
+        enabled = shell.get_strv("enabled-extensions")
+        if EXT_UUID not in enabled:
+            shell.set_strv("enabled-extensions", enabled + [EXT_UUID])
+    Gio.Settings.sync()
+    with open(SETUP_MARK, "w", encoding="utf-8") as f:
+        f.write(command + "\n")
+    log(f"desktop setup done (Super+V runs {command})")
+
+
+def desktop_remove_setup():
+    """Undo desktop_setup()."""
+    media = _settings(MEDIA_KEYS)
+    custom = _settings(MEDIA_KEYS + ".custom-keybinding", KB_PATH)
+    if media and custom:
+        media.set_strv("custom-keybindings",
+                       [p for p in media.get_strv("custom-keybindings") if p != KB_PATH])
+        for key in ("name", "command", "binding"):
+            custom.reset(key)
+    shell_keys = _settings("org.gnome.shell.keybindings")
+    if shell_keys and shell_keys.get_strv("toggle-message-tray") == ["<Super>m"]:
+        try:
+            with open(SAVED_TRAY, encoding="utf-8") as f:
+                saved = GLib.Variant.parse(GLib.VariantType.new("as"), f.read().strip(),
+                                           None, None).unpack()
+            shell_keys.set_strv("toggle-message-tray", saved)
+        except (OSError, GLib.Error):
+            shell_keys.reset("toggle-message-tray")
+    shell = _settings("org.gnome.shell")
+    if shell:
+        shell.set_strv("enabled-extensions",
+                       [e for e in shell.get_strv("enabled-extensions") if e != EXT_UUID])
+    Gio.Settings.sync()
+    for path in (SAVED_TRAY, SETUP_MARK):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    log("desktop setup removed")
+
+
+def own_command():
+    """Absolute path of this program, for the Super+V binding."""
+    return os.path.realpath(sys.argv[0])
 
 
 # --------------------------------------------------------------------------
@@ -594,7 +686,7 @@ class PickerWindow(Adw.ApplicationWindow):
         self.has_pinned = False
         self.filter = "all"
         self.set_default_size(*WINDOW_SIZES[self.layout])
-        self.set_icon_name("edit-paste")
+        self.set_icon_name(APP_ID)
 
         if self.layout == "tiles":
             self.container = Gtk.FlowBox(
@@ -1243,6 +1335,12 @@ class ShotClipApp(Adw.Application):
         first_run = not self.history.exists_on_disk
         self.history.load()
         self.history.listeners.append(self._on_history_changed)
+        if not os.path.exists(SETUP_MARK):
+            # First run for this user (e.g. installed from the .deb).
+            try:
+                desktop_setup(own_command())
+            except (OSError, GLib.Error) as e:
+                log(f"desktop setup failed: {e}")
         self.watch_dirs = detect_screenshot_dirs(self.config)
         if first_run:
             self._import_existing(self.config["import_existing"])
@@ -1496,6 +1594,16 @@ class ShotClipApp(Adw.Application):
 
 
 def main():
+    # These run without a display (e.g. from the package's install scripts).
+    if "--version" in sys.argv[1:]:
+        print(f"{APP_NAME} {VERSION}")
+        return 0
+    if "--setup" in sys.argv[1:]:
+        desktop_setup(own_command())
+        return 0
+    if "--remove-setup" in sys.argv[1:]:
+        desktop_remove_setup()
+        return 0
     Adw.init()
     app = ShotClipApp()
     return app.run(sys.argv)

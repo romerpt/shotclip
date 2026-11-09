@@ -6,7 +6,8 @@ set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="$SRC_DIR/dist/shotclip-installer.sh"
-FILES=(shotclip.py install.sh uninstall.sh README.md extension/extension.js extension/metadata.json)
+FILES=(LICENSE shotclip.py install.sh uninstall.sh README.md extension/extension.js extension/metadata.json
+       data/io.github.shotclip.svg)
 
 mkdir -p "$SRC_DIR/dist"
 cat >"$OUT" <<'EOF'

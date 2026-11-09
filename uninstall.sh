@@ -7,6 +7,7 @@ APP_ID="io.github.shotclip"
 BIN="$HOME/.local/bin/shotclip"
 DESKTOP="$HOME/.local/share/applications/$APP_ID.desktop"
 AUTOSTART="$HOME/.config/autostart/$APP_ID.desktop"
+ICON="$HOME/.local/share/icons/hicolor/scalable/apps/$APP_ID.svg"
 STATE_DIR="$HOME/.local/state/shotclip"
 SAVED_TRAY="$STATE_DIR/toggle-message-tray.orig"
 
@@ -57,7 +58,7 @@ if [[ "$current_tray" == "['<Super>m']" ]]; then
 else
     say "toggle-message-tray was changed by you since install ($current_tray); leaving it"
 fi
-rm -f "$SAVED_TRAY"
+rm -f "$SAVED_TRAY" "$STATE_DIR/setup-done"
 
 # 4. Text capture extension ---------------------------------------------------
 say "Removing GNOME Shell extension $EXT_UUID"
@@ -68,7 +69,7 @@ rm -rf "$EXT_DIR"
 
 # 5. Files ---------------------------------------------------------------------
 say "Removing binary and desktop entries"
-rm -f "$BIN" "$DESKTOP" "$AUTOSTART"
+rm -f "$BIN" "$DESKTOP" "$AUTOSTART" "$ICON"
 update-desktop-database "$(dirname "$DESKTOP")" >/dev/null 2>&1 || true
 
 say "Done. History kept in ~/.local/share/shotclip (delete it manually if you want)."

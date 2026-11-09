@@ -1,85 +1,215 @@
 # ShotClip
 
-Clipboard history for GNOME on Wayland, like Windows' Win+V. It keeps your
-screenshots, the images and text you copy, and pastes the item you pick into
-the app you were using.
+Clipboard history for GNOME on Wayland, like Windows' Win+V. Press
+**Super+V** to see the screenshots, images and text you copied, pick one, and
+it is pasted into the app you were using.
+
+<p align="center">
+  <img src="docs/list.png" alt="ShotClip's picker in the List layout: a pinned link, a screenshot and several copied texts" width="360">
+  <img src="docs/compact.png" alt="ShotClip's picker in the Compact rows layout, one line per item" width="360">
+</p>
+<p align="center">
+  <img src="docs/tiles.png" alt="ShotClip's picker in the Tiles layout: a three-column grid with All, Images, Text and Pinned filters" width="600">
+</p>
+
+- **Screenshots, images and text**: new screenshots (Print Screen) show up on
+  their own, and so does anything you copy in any app.
+- **Paste in one keystroke**: Enter, a click or 1–9 pastes into the previous
+  app; text copied with formatting can be pasted with it.
+- **Pin, search, remove**: pinned items are never dropped from the history.
+- **Three layouts**: List, Compact rows or Tiles, picked in Preferences.
+- **Private by default**: copies that password managers mark as secret are
+  never stored, and you can exclude any app.
+
+## Why it works this way
+
+Wayland doesn't let background apps read the clipboard. ShotClip ships a
+small GNOME Shell extension (the shell *is* allowed to see clipboard changes)
+that forwards each copy to the ShotClip app over D-Bus, sets the clipboard
+when you pick an item and sends the paste keystroke. The app itself is a
+GTK 4 / libadwaita program in a single Python file.
 
 ## Requirements
 
-- GNOME Shell 48–50 on Wayland (e.g. Ubuntu 26.04)
-- `python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-gdkpixbuf-2.0` (the installer
-  offers to install missing ones with `sudo apt`)
+- GNOME Shell 48, 49 or 50 on Wayland (for example Ubuntu 25.04 or later)
+- Python 3 with PyGObject, GTK 4 and libadwaita 1.5 or later:
+  `python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-gdkpixbuf-2.0`
 
 ## Install
 
-```bash
-bash shotclip-installer.sh
-```
+### From the .deb (Ubuntu, Debian)
 
-Then **log out and back in once**: GNOME only loads the ShotClip shell
-extension at login on Wayland.
-
-To remove it (your history is kept in `~/.local/share/shotclip`):
+Download `shotclip_<version>_all.deb` from the
+[Releases](https://github.com/romerpt/shotclip/releases) page, then:
 
 ```bash
-bash shotclip-installer.sh --uninstall
+sudo apt install ./shotclip_1.0.0_all.deb   # use the file name you downloaded
 ```
+
+Then **log out and back in once**: GNOME only loads a newly installed shell
+extension at login on Wayland. After that, press Super+V.
+
+The package installs ShotClip for every user of the computer. Super+V and the
+shell extension are switched on for you during the install, and for other
+users the first time they log in.
+
+To remove it (your history stays in `~/.local/share/shotclip`):
+
+```bash
+sudo apt remove shotclip
+```
+
+### Without root (any distribution with GNOME 48+)
+
+```bash
+git clone https://github.com/romerpt/shotclip.git
+cd shotclip
+./install.sh
+```
+
+This installs into your home folder only (`~/.local`), and offers to install
+the missing packages with `sudo apt` if needed. Log out and back in once, as
+above. To remove it, run `./uninstall.sh`.
+
+> Use one method, not both. A home-folder install takes precedence over the
+> .deb, so run `./uninstall.sh` before switching to the package.
 
 ## Use
 
-Press **Super+V**.
+Press **Super+V**. The picker closes when you pick an item, press Esc or
+click elsewhere.
 
 | Key | Action |
 |---|---|
-| Enter / click / 1–9 | Copy the item and paste it into the previous app |
-| Shift+Enter | Copy only (paste yourself with Ctrl+V) |
-| Ctrl+Enter | Paste with formatting (items marked "formatted"; for apps that accept HTML such as LibreOffice, browsers, mail) |
-| Arrows, Home, End | Move the selection |
-| P | Pin / unpin (pinned items are never removed) |
+| Enter, click, or 1–9 | Paste the item into the app you were using |
+| Shift+Enter | Copy only (paste it yourself with Ctrl+V) |
+| Ctrl+Enter | Paste with formatting (items marked "Formatted"; for apps that accept HTML, such as LibreOffice, browsers and mail) |
+| Arrow keys, Home, End, Page Up/Down | Move the selection |
+| P | Pin or unpin (pinned items are never removed) |
 | Del | Remove the item |
-| Ctrl+F | Search text and file names (↑/↓ and Enter work while typing) |
-| Ctrl+, | Preferences (layout, history size, auto-paste, excluded apps) |
+| Ctrl+F | Search text and file names (arrows and Enter still work while typing) |
+| Ctrl+, | Preferences |
 | Ctrl+Shift+Del | Clear all unpinned items (asks first) |
-| Esc, or click elsewhere | Close (closes the search first if it is open) |
+| Esc | Close the search, then the picker |
 
-New screenshots (Print Screen) appear automatically, as do text and images
-copied in any app. Text copied with formatting (web pages, LibreOffice, mail)
-keeps it: Enter pastes the plain text (works everywhere), Ctrl+Enter pastes the
-formatting into apps that accept HTML. When
-a copy offers both text and an image (e.g. a spreadsheet range), the text is
-kept. Copies that password managers mark as secret are skipped, as are copies
-made in apps listed in `exclude_apps`.
+Notes:
 
-## What the installer changes
+- Text copied with formatting (web pages, LibreOffice, mail) keeps it: Enter
+  pastes plain text, which works everywhere, and Ctrl+Enter pastes the
+  formatting into apps that accept HTML.
+- When a copy has both text and an image (a spreadsheet range, for example),
+  the text is kept.
+- GNOME's screenshot tool both saves a file and copies the image; ShotClip
+  keeps only one of them.
 
-- Installs `~/.local/bin/shotclip`, a desktop entry, an autostart entry, and
-  the GNOME Shell extension `shotclip@shotclip.github.io`.
-- Moves GNOME's "show notification list" shortcut from Super+V to **Super+M**
-  only, and binds Super+V to ShotClip.
-- Uninstalling reverts all of this.
+## Layouts
 
-## Settings
+Pick one in **Preferences › Appearance › Layout** (gear button or Ctrl+,).
 
-`~/.config/shotclip/config.json`:
+| Layout | Best for |
+|---|---|
+| **List** (default) | A mix of text and screenshots: cards with three lines of text or a wide image preview |
+| **Compact rows** | Mostly text: one line per item, about a dozen on screen, search always open |
+| **Tiles** | Mostly screenshots: a three-column grid with All, Images, Text and Pinned filters |
+
+## Preferences
+
+<img src="docs/preferences.png" alt="ShotClip's Preferences dialog with Layout, History and Picking an item settings" width="360" align="right">
+
+The Preferences dialog (gear button or Ctrl+,) changes:
+
+- **Layout** of the picker
+- **Items to keep**: unpinned items kept in the history
+- **Keep copied text**: turn off to keep only screenshots and images
+- **Paste right away**: turn off to only copy the picked item
+- **Never record copies from**: apps whose copies are ignored
+
+Everything is stored in `~/.config/shotclip/config.json`, which you can also
+edit by hand; changes apply without a restart.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `max_items` | 50 | Unpinned items to keep |
-| `watch_dirs` | `[]` | Screenshot folders; empty = auto-detect |
-| `import_existing` | 20 | Screenshots imported on first run |
+| `layout` | `"list"` | `"list"`, `"compact"` or `"tiles"` |
+| `max_items` | `50` | Unpinned items to keep |
 | `capture_text` | `true` | Record copied text |
 | `auto_paste` | `true` | Paste after picking (otherwise copy only) |
-| `exclude_apps` | `[]` | Apps whose copies are never recorded, e.g. `["org.keepassxc.KeePassXC", "1password"]` |
-| `layout` | `"list"` | Picker layout: `"list"` (cards), `"compact"` (one line per item) or `"tiles"` (a grid with Images/Text/Pinned filters) |
+| `exclude_apps` | `[]` | App ids whose copies are never recorded, e.g. `["org.keepassxc.keepassxc"]` |
+| `watch_dirs` | `[]` | Screenshot folders; empty means the GNOME Screenshots folder, found automatically |
+| `import_existing` | `20` | Screenshots imported on the very first run |
 
-`exclude_apps` and the other settings apply as soon as the file is saved
-(`max_items` on the next copy). To find an app's id, copy something in it and
-look at the log: each entry says `from <ids>`; any of those ids works.
+To find an app's id, copy something in it and look at the log
+(`journalctl --user -t shotclip`): each entry ends with `from <ids>`, and any
+of those ids works.
 
-Logs: `journalctl --user -t shotclip`
+<br clear="right">
+
+## What gets changed on your system
+
+- **Super+V** opens ShotClip. GNOME's own Super+V shortcut (show the
+  notification list) moves to **Super+M**, which GNOME already uses for it.
+- The GNOME Shell extension `shotclip@shotclip.github.io` is installed and
+  enabled.
+- ShotClip starts in the background at login, so copies are recorded.
+
+Removing ShotClip (`sudo apt remove shotclip` or `./uninstall.sh`) undoes all
+of this and gives Super+V back to GNOME.
 
 ## Privacy
 
-History is stored unencrypted in `~/.local/share/shotclip/` (text inside
-`history.json`, screenshots in `images/`). Pin nothing sensitive, or delete
-items with Del.
+- Nothing leaves your computer. ShotClip makes no network connections.
+- The history is stored **unencrypted** in `~/.local/share/shotclip/`: text in
+  `history.json`, images in `images/`.
+- Copies that password managers mark as secret (`x-kde-passwordManagerHint`,
+  used by KeePassXC and others) are never stored. Add other apps to "Never
+  record copies from".
+- Remove anything sensitive with Del, or clear the history with
+  Ctrl+Shift+Del.
+
+## Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| Super+V does nothing | Log out and back in once after installing. Check Settings › Keyboard › Custom Shortcuts for "ShotClip". |
+| "Can't copy: the ShotClip shell extension isn't loaded" | Log out and back in. Check `gnome-extensions info shotclip@shotclip.github.io` shows `State: ACTIVE`. |
+| Copied text doesn't appear | Make sure "Keep copied text" is on and the app isn't excluded. The log shows each copy. |
+| Screenshots don't appear | If you save them somewhere other than Pictures/Screenshots, set `watch_dirs`. |
+| You still see an old version | The background copy keeps running the old code: run `shotclip --quit`, then press Super+V. |
+
+Logs: `journalctl --user -t shotclip`
+
+## Command line
+
+```
+shotclip                 open the picker (starts ShotClip if needed)
+shotclip --daemon        start in the background without opening the picker
+shotclip --quit          stop the running ShotClip
+shotclip --setup         turn on Super+V and the shell extension for this user
+shotclip --remove-setup  undo --setup
+shotclip --version       print the version
+```
+
+## Building
+
+| Command | Output |
+|---|---|
+| `./make-deb.sh` | `dist/shotclip_<version>_all.deb`, the Debian/Ubuntu package |
+| `./make-installer.sh` | `dist/shotclip-installer.sh`, a single self-extracting file that runs `install.sh` (`--uninstall` to remove) |
+
+The version comes from `VERSION` in `shotclip.py`. Building the .deb needs
+`dpkg-deb` (part of `dpkg`).
+
+## Project layout
+
+```
+shotclip.py              the app: history, picker window, preferences
+extension/               GNOME Shell extension (clipboard access, paste)
+data/                    app icon
+install.sh, uninstall.sh per-user install into ~/.local
+make-deb.sh              builds the .deb
+make-installer.sh        builds the self-extracting installer
+docs/                    screenshots for this README
+```
+
+## License
+
+[MIT](LICENSE) © 2026 Vitor Sousa
