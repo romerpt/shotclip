@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=ShotClip
+Comment=Clipboard history for screenshots and text
+Exec=shotclip
+Icon=io.github.shotclip
+Terminal=false
+Categories=Utility;
+Keywords=clipboard;history;paste;screenshot;
+StartupNotify=true

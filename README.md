@@ -194,20 +194,24 @@ shotclip --version       print the version
 |---|---|
 | `./make-deb.sh` | `dist/shotclip_<version>_all.deb`, the Debian/Ubuntu package |
 | `./make-installer.sh` | `dist/shotclip-installer.sh`, a single self-extracting file that runs `install.sh` (`--uninstall` to remove) |
+| `./make-ppa.sh` | `dist/ppa/`, the signed source package for the Launchpad PPA (`--upload` to send it) |
+| `gnome-extensions pack extension/ --out-dir dist` | The extension zip for extensions.gnome.org |
 
-The version comes from `VERSION` in `shotclip.py`. Building the .deb needs
-`dpkg-deb` (part of `dpkg`).
+The version comes from `VERSION` in `shotclip.py` and must match
+`debian/changelog`. How to publish a release: [docs/PUBLISHING.md](docs/PUBLISHING.md).
 
 ## Project layout
 
 ```
 shotclip.py              the app: history, picker window, preferences
 extension/               GNOME Shell extension (clipboard access, paste)
-data/                    app icon
+data/                    app icon and desktop entries
+debian/                  Debian/Ubuntu packaging (used by the PPA and make-deb.sh)
 install.sh, uninstall.sh per-user install into ~/.local
 make-deb.sh              builds the .deb
+make-ppa.sh              builds and uploads the PPA source package
 make-installer.sh        builds the self-extracting installer
-docs/                    screenshots for this README
+docs/                    screenshots and the publishing guide
 ```
 
 ## License

@@ -1,0 +1,22 @@
+#!/usr/bin/make -f
+
+PKG := debian/shotclip
+EXT := $(PKG)/usr/share/gnome-shell/extensions/shotclip@shotclip.github.io
+
+%:
+	dh $@
+
+override_dh_auto_install:
+	install -Dm755 shotclip.py $(PKG)/usr/bin/shotclip
+	sed -i '1s|^#!.*|#!/usr/bin/python3|' $(PKG)/usr/bin/shotclip
+	install -Dm644 extension/extension.js $(EXT)/extension.js
+	install -Dm644 extension/metadata.json $(EXT)/metadata.json
+	install -Dm644 data/io.github.shotclip.svg \
+		$(PKG)/usr/share/icons/hicolor/scalable/apps/io.github.shotclip.svg
+	install -Dm644 data/io.github.shotclip.desktop \
+		$(PKG)/usr/share/applications/io.github.shotclip.desktop
+	install -Dm644 data/io.github.shotclip-autostart.desktop \
+		$(PKG)/etc/xdg/autostart/io.github.shotclip.desktop
+
+# Nothing to build or test.
+override_dh_auto_build override_dh_auto_test:

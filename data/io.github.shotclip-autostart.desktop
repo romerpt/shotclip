@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=ShotClip (daemon)
+Comment=Keeps the clipboard history
+Exec=systemd-cat -t shotclip shotclip --daemon
+Icon=io.github.shotclip
+Terminal=false
+NoDisplay=true
+OnlyShowIn=GNOME;
+X-GNOME-Autostart-enabled=true

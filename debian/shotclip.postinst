@@ -1,0 +1,49 @@
+#!/bin/sh
+set -e
+
+# The user who ran apt (sudo) or GNOME Software / App Center (pkexec).
+target_user() {
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then echo "$SUDO_USER"
+    elif [ -n "${PKEXEC_UID:-}" ]; then id -nu "$PKEXEC_UID" 2>/dev/null || true
+    fi
+}
+
+# Run a command as $1 inside their desktop session, if they have one.
+as_user() {
+    u="$1"; shift
+    uid="$(id -u "$u")"
+    [ -S "/run/user/$uid/bus" ] || return 1
+    runuser -u "$u" -- env XDG_RUNTIME_DIR="/run/user/$uid" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" "$@"
+}
+
+if [ "$1" = configure ]; then
+    user="$(target_user)"
+    if [ -n "$user" ]; then
+        # Super+V and the shell extension for this user (everyone else gets
+        # them from the daemon on their first login).
+        as_user "$user" /usr/bin/shotclip --setup >/dev/null 2>&1 || true
+        # Upgrade: restart a running daemon so the new version is used.
+        if pgrep -u "$user" -f "shotclip --daemon" >/dev/null 2>&1; then
+            as_user "$user" gdbus call --session --dest io.github.shotclip \
+                --object-path /io/github/shotclip --method org.gtk.Actions.Activate \
+                quit "[]" "{}" >/dev/null 2>&1 || true
+            sleep 1
+            as_user "$user" systemd-run --user --quiet --collect \
+                systemd-cat -t shotclip /usr/bin/shotclip --daemon >/dev/null 2>&1 || true
+        fi
+        home="$(getent passwd "$user" | cut -d: -f6)"
+        if [ -e "$home/.local/bin/shotclip" ]; then
+            echo "Note: a per-user ShotClip is installed in $home/.local and takes"
+            echo "precedence. Remove it with uninstall.sh from its source folder."
+        fi
+    fi
+    if [ -z "$2" ]; then
+        echo "ShotClip installed. Log out and back in once to finish (GNOME loads the"
+        echo "ShotClip shell extension at login). Then press Super+V."
+    fi
+fi
+
+#DEBHELPER#
+
+exit 0

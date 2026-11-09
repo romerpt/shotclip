@@ -1,0 +1,29 @@
+Source: shotclip
+Section: utils
+Priority: optional
+Maintainer: Vitor Sousa <vitor.aos@gmail.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+Homepage: https://github.com/romerpt/shotclip
+Vcs-Browser: https://github.com/romerpt/shotclip
+Vcs-Git: https://github.com/romerpt/shotclip.git
+
+Package: shotclip
+Architecture: all
+Depends: ${misc:Depends},
+         python3,
+         python3-gi,
+         gir1.2-gtk-4.0,
+         gir1.2-adw-1 (>= 1.5),
+         gir1.2-gdkpixbuf-2.0,
+         gnome-shell (>= 48),
+         systemd
+Description: clipboard history for GNOME on Wayland (Super+V)
+ ShotClip keeps the screenshots, images and text you copy and shows them in a
+ picker on Super+V. Pick an item to paste it into the app you were using.
+ Items can be pinned, searched and shown as a list, compact rows or tiles.
+ .
+ Wayland only lets GNOME Shell read the clipboard, so ShotClip includes a
+ small GNOME Shell extension that passes copies to the app. Copies that
+ password managers mark as secret are never stored.

@@ -1,0 +1,29 @@
+#!/bin/sh
+set -e
+
+target_user() {
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then echo "$SUDO_USER"
+    elif [ -n "${PKEXEC_UID:-}" ]; then id -nu "$PKEXEC_UID" 2>/dev/null || true
+    fi
+}
+
+as_user() {
+    u="$1"; shift
+    uid="$(id -u "$u")"
+    [ -S "/run/user/$uid/bus" ] || return 1
+    runuser -u "$u" -- env XDG_RUNTIME_DIR="/run/user/$uid" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" "$@"
+}
+
+if [ "$1" = remove ]; then
+    # Give Super+V back to GNOME and disable the extension for this user.
+    user="$(target_user)"
+    if [ -n "$user" ]; then
+        as_user "$user" /usr/bin/shotclip --remove-setup >/dev/null 2>&1 || true
+    fi
+    pkill -f "/usr/bin/shotclip" >/dev/null 2>&1 || true
+fi
+
+#DEBHELPER#
+
+exit 0
