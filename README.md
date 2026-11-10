@@ -37,6 +37,16 @@ GTK 4 / libadwaita program in a single Python file.
 
 ## Install
 
+### From the PPA (Ubuntu 26.04, recommended)
+
+```bash
+sudo add-apt-repository ppa:romerpt/shotclip
+sudo apt install shotclip
+```
+
+Then **log out and back in once** (see below). Updates arrive with your
+normal system updates.
+
 ### From the .deb (Ubuntu, Debian)
 
 Download `shotclip_<version>_all.deb` from the

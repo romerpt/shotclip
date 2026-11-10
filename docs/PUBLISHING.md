@@ -109,9 +109,10 @@ than 25.04.
    ```
 3. Commit, then `./make-ppa.sh --upload`.
 
-### After the first build: tell users
+### Telling users
 
-Add this to the top of the README's **Install** section:
+The README's **Install** section starts with these instructions (added
+after the first build, 1.0.0 for `resolute`):
 
 ````markdown
 ### From the PPA (Ubuntu, recommended)
