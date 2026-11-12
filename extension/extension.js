@@ -1,7 +1,8 @@
 // ShotClip shell helper.
 //  - On every clipboard change, read the copy (text, its HTML formatting if
-//    any, or an image for image-only copies) plus the app it came from, and
-//    hand it to the ShotClip daemon via its GApplication action "add-clip".
+//    any, an image for image-only copies, or video files copied in a file
+//    manager) plus the app it came from, and hand it to the ShotClip daemon
+//    via its GApplication action "add-clip".
 //  - Export io.github.shotclip.Shell so the daemon can set the clipboard from
 //    inside the shell (a background client owning the clipboard on GNOME
 //    Wayland is unreliable; a shell-owned selection always pastes), and paste
@@ -31,8 +32,10 @@ const TEXT_TYPES = ['text/plain', 'text/plain;charset=utf-8', 'UTF8_STRING', 'ST
 const HTML_TYPE = 'text/html';
 // Password managers (KeePassXC, ...) mark secrets with this type; never store them.
 const SECRET_HINT = 'x-kde-passwordManagerHint';
-// Files copied in Nautilus also offer text/plain paths; those are not text copies.
+// Files copied in Nautilus also offer text/plain paths; those are not text
+// copies. Only video files (screencasts) among them are recorded.
 const COPIED_FILES = 'x-special/gnome-copied-files';
+const VIDEO_EXTS = ['.webm', '.mp4', '.mkv', '.mov'];
 
 const SHELL_IFACE = `
 <node>
@@ -148,10 +151,15 @@ export default class ShotClipExtension extends Extension {
         if (type !== Meta.SelectionType.SELECTION_CLIPBOARD || !source)
             return;
         const mimes = source.get_mimetypes();
-        if (mimes.includes(SECRET_HINT) || mimes.includes(COPIED_FILES))
+        if (mimes.includes(SECRET_HINT))
             return;
         // Identify the app now: focus may move before the content arrives.
         const apps = this._focusedAppIds();
+        if (mimes.includes(COPIED_FILES)) {
+            this._clipboard.get_content(St.ClipboardType.CLIPBOARD, COPIED_FILES,
+                (_cb, bytes) => this._sendVideoFiles(bytes, apps));
+            return;
+        }
         if (mimes.some(m => TEXT_TYPES.includes(m))) {
             // Text wins when both are offered (e.g. a spreadsheet range also
             // offers a rendered image of itself).
@@ -172,6 +180,23 @@ export default class ShotClipExtension extends Extension {
             this._clipboard.get_content(St.ClipboardType.CLIPBOARD, imageType,
                 (_cb, image) => this._sendClip({image, mime: imageType}, apps));
         }
+    }
+
+    _sendVideoFiles(bytes, apps) {
+        // "copy\nfile:///a.webm\nfile:///b.mp4" (or "cut\n...").
+        if (!bytes || bytes.get_size() === 0 || bytes.get_size() > MAX_CHARS)
+            return;
+        const lines = new TextDecoder().decode(bytes.toArray()).split(/\r?\n/).slice(1);
+        const files = [];
+        for (const uri of lines) {
+            if (!uri.startsWith('file://'))
+                continue;
+            const path = Gio.File.new_for_uri(uri).get_path();
+            if (path && VIDEO_EXTS.some(ext => path.toLowerCase().endsWith(ext)))
+                files.push(path);
+        }
+        if (files.length)
+            this._call({apps: new GLib.Variant('as', apps), files: new GLib.Variant('as', files)});
     }
 
     _focusedAppIds() {
@@ -200,6 +225,10 @@ export default class ShotClipExtension extends Extension {
             clip.image = new GLib.Variant('ay', image.toArray());
             clip.mime = new GLib.Variant('s', mime);
         }
+        this._call(clip);
+    }
+
+    _call(clip) {
         Gio.DBus.session.call(
             BUS_NAME, OBJECT_PATH, 'org.gtk.Actions', 'Activate',
             new GLib.Variant('(sava{sv})', ['add-clip', [new GLib.Variant('a{sv}', clip)], {}]),

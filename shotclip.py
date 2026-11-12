@@ -2,8 +2,9 @@
 """ShotClip - screenshot and text clipboard history for GNOME on Wayland (Win+V style).
 
 Wayland does not let background apps read the clipboard, so instead of polling
-it ShotClip watches the GNOME Screenshots folder for images, and receives copied
-text from its companion GNOME Shell extension over D-Bus.
+it ShotClip watches the GNOME Screenshots and Screencasts folders, and receives
+copies from its companion GNOME Shell extension over D-Bus. WebM screencasts
+are converted to MP4 with ffmpeg; picking one puts the file on the clipboard.
 
 Usage:
   shotclip              show the picker (starts the instance if needed)
@@ -28,8 +29,11 @@ import gettext
 import hashlib
 import json
 import os
+import queue
 import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timedelta
@@ -45,7 +49,7 @@ from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, GObject, Gtk, Pango  #
 
 APP_ID = "io.github.shotclip"
 APP_NAME = "ShotClip"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 # D-Bus object exported by the ShotClip GNOME Shell extension (extension/).
 SHELL_BUS_NAME = "org.gnome.Shell"
@@ -55,11 +59,14 @@ SHELL_HELPER_IFACE = "io.github.shotclip.Shell"
 DATA_DIR = os.path.join(GLib.get_user_data_dir(), "shotclip")
 IMAGES_DIR = os.path.join(DATA_DIR, "images")
 HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
+VIDEO_THUMBS_DIR = os.path.join(DATA_DIR, "video-thumbs")
+VIDEOS_DIR = os.path.join(DATA_DIR, "videos")  # MP4s that can't go next to the original
 CONFIG_DIR = os.path.join(GLib.get_user_config_dir(), "shotclip")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
 STATE_DIR = os.path.join(GLib.get_user_state_dir(), "shotclip")
 SETUP_MARK = os.path.join(STATE_DIR, "setup-done")
+VIDEOS_IMPORTED_MARK = os.path.join(STATE_DIR, "videos-imported")
 SAVED_TRAY = os.path.join(STATE_DIR, "toggle-message-tray.orig")  # shared with install.sh
 MEDIA_KEYS = "org.gnome.settings-daemon.plugins.media-keys"
 KB_PATH = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/shotclip/"
@@ -67,10 +74,17 @@ EXT_UUID = "shotclip@shotclip.github.io"
 
 DEFAULT_CONFIG = {"max_items": 50, "watch_dirs": [], "import_existing": 20,
                   "capture_text": True, "auto_paste": True, "exclude_apps": [],
-                  "layout": "list"}
+                  "layout": "list", "theme": "auto", "capture_videos": True,
+                  "convert_videos": True, "video_dirs": []}
 PICKER_LAYOUTS = ("list", "compact", "tiles")
+THEMES = ("auto", "light", "dark")
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp")  # screenshot files to pick up
+# Screencasts: GNOME records WebM (VP8), or MP4 when it can encode H.264.
+VIDEO_EXTS = (".webm", ".mp4", ".mkv", ".mov")
+CONVERT_EXTS = (".webm", ".mkv")  # converted to MP4, which every app can open
+VIDEO_SETTLE_MS = 1500  # a recording is written for a while; wait longer
+IMPORT_EXISTING_VIDEOS = 3  # newest screencasts imported once, on first use
 # Known translations of GNOME Shell's "Screenshots" folder, used as fallbacks
 # when the gettext lookup does not match what is on disk.
 SCREENSHOT_DIR_FALLBACKS = (
@@ -83,6 +97,17 @@ SCREENSHOT_DIR_FALLBACKS = (
     "Schermate",
     "Schermafbeeldingen",
     "Zrzuty ekranu",
+)
+SCREENCAST_DIR_FALLBACKS = (
+    "Screencasts",
+    "Gravações de ecrã",
+    "Gravações de tela",
+    "Grabaciones de pantalla",
+    "Captures vidéo d’écran",
+    "Bildschirmaufzeichnungen",
+    "Registrazioni schermo",
+    "Schermopnamen",
+    "Nagrania ekranu",
 )
 
 THUMB_W, THUMB_H = 560, 360  # sharp enough for HiDPI list previews
@@ -128,6 +153,28 @@ def is_image_name(name):
     return name.lower().endswith(IMAGE_EXTS) and not name.startswith(".")
 
 
+def is_video_name(name):
+    return name.lower().endswith(VIDEO_EXTS) and not name.startswith(".")
+
+
+def has_ffmpeg():
+    return bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
+
+
+def apply_theme(theme):
+    """Follow the system style, or force light or dark."""
+    schemes = {"auto": Adw.ColorScheme.DEFAULT, "light": Adw.ColorScheme.FORCE_LIGHT,
+               "dark": Adw.ColorScheme.FORCE_DARK}
+    Adw.StyleManager.get_default().set_color_scheme(schemes.get(theme, Adw.ColorScheme.DEFAULT))
+
+
+def format_duration(seconds):
+    seconds = int(round(seconds or 0))
+    if seconds >= 3600:
+        return f"{seconds // 3600}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
 def decode_html(data):
     """text/html as copied: UTF-8, or UTF-16 with a BOM (some browsers)."""
     if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
@@ -160,35 +207,48 @@ def load_config():
         cfg["import_existing"] = DEFAULT_CONFIG["import_existing"]
     if not isinstance(cfg["watch_dirs"], list):
         cfg["watch_dirs"] = []
+    if not isinstance(cfg["video_dirs"], list):
+        cfg["video_dirs"] = []
     if not isinstance(cfg["exclude_apps"], list):
         cfg["exclude_apps"] = []
     cfg["exclude_apps"] = [str(a).casefold().removesuffix(".desktop") for a in cfg["exclude_apps"]]
     if cfg["layout"] not in PICKER_LAYOUTS:
         cfg["layout"] = DEFAULT_CONFIG["layout"]
+    if cfg["theme"] not in THEMES:
+        cfg["theme"] = DEFAULT_CONFIG["theme"]
     return cfg
 
 
-def detect_screenshot_dirs(cfg):
-    if cfg["watch_dirs"]:
-        return [os.path.expanduser(d) for d in cfg["watch_dirs"]]
+def _detect_shell_dirs(configured, special_dir, fallback_parent, folder, fallbacks):
+    if configured:
+        # Normalized: file events are matched against these paths.
+        return [os.path.normpath(os.path.expanduser(d)) for d in configured]
 
-    pictures = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_PICTURES)
-    if not pictures:
-        pictures = os.path.expanduser("~/Pictures")
-    localized = gettext.dgettext("gnome-shell", "Screenshots")
-    names = [localized] + [n for n in SCREENSHOT_DIR_FALLBACKS if n != localized]
+    parent = GLib.get_user_special_dir(special_dir) or os.path.expanduser(fallback_parent)
+    localized = gettext.dgettext("gnome-shell", folder)
+    names = [localized] + [n for n in fallbacks if n != localized]
 
     found = []
     for name in names:
-        path = os.path.join(pictures, name)
+        path = os.path.join(parent, name)
         if os.path.isdir(path) and path not in found:
             found.append(path)
     if not found:
-        # GNOME Shell creates exactly this folder on the first screenshot.
-        path = os.path.join(pictures, localized)
+        # GNOME Shell creates exactly this folder on the first capture.
+        path = os.path.join(parent, localized)
         os.makedirs(path, exist_ok=True)
         found.append(path)
     return found
+
+
+def detect_screenshot_dirs(cfg):
+    return _detect_shell_dirs(cfg["watch_dirs"], GLib.UserDirectory.DIRECTORY_PICTURES,
+                              "~/Pictures", "Screenshots", SCREENSHOT_DIR_FALLBACKS)
+
+
+def detect_screencast_dirs(cfg):
+    return _detect_shell_dirs(cfg["video_dirs"], GLib.UserDirectory.DIRECTORY_VIDEOS,
+                              "~/Videos", "Screencasts", SCREENCAST_DIR_FALLBACKS)
 
 
 # --------------------------------------------------------------------------
@@ -281,6 +341,11 @@ class History:
     Image items: kind="image", sha1, file, source, added, pinned, width, height.
     Text items:  kind="text", sha1, text, added, pinned, html (optional
                  formatting as copied).
+    Video items: kind="video", sha1 (of the original's path), source (the
+                 recording), file (what is pasted: the MP4 once converted),
+                 status ("processing", "ready" or "failed"), thumb, width,
+                 height, duration, added, pinned. The video files are the
+                 user's own and are never deleted by ShotClip.
     """
 
     def __init__(self, max_items):
@@ -306,9 +371,12 @@ class History:
             items = []
         self.items = [i for i in items
                       if (i.get("kind") == "text" and isinstance(i.get("text"), str))
-                      or os.path.exists(i.get("file", ""))]
+                      or os.path.exists(i.get("file", ""))
+                      or (i.get("kind") == "video" and os.path.exists(i.get("source", "")))]
         for i in self.items:
             i.setdefault("kind", "image")
+            if i["kind"] == "video" and not os.path.exists(i.get("file", "")):
+                i["file"] = i["source"]  # the MP4 was deleted; paste the recording
 
     def save(self):
         atomic_write_json(HISTORY_FILE, {"version": 1, "items": self.items})
@@ -406,6 +474,30 @@ class History:
         self.changed()
         return item
 
+    def find_video(self, path):
+        """The video item recorded as, or converted to, path."""
+        return next((i for i in self.items if i["kind"] == "video"
+                     and path in (i.get("source"), i.get("file"))), None)
+
+    def add_video(self, path, added=None, notify=True):
+        """Add a screencast (processed later by VideoWorker). Returns the item
+        and whether it is new."""
+        path = os.path.realpath(path)
+        item = self.find_video(path)
+        if item:
+            item["added"] = max(item.get("added", 0), added or time.time())
+            new = False
+        else:
+            item = {"kind": "video", "sha1": hashlib.sha1(path.encode("utf-8")).hexdigest(),
+                    "source": path, "file": path, "status": "processing",
+                    "added": added if added is not None else time.time(), "pinned": False}
+            self.items.append(item)
+            new = True
+        self.trim()
+        if notify:
+            self.changed()
+        return item, new
+
     def clear_unpinned(self):
         for item in [i for i in self.items if not i.get("pinned")]:
             self._drop(item)
@@ -440,7 +532,14 @@ class History:
 
     def _drop(self, item):
         self.items.remove(item)
-        if item.get("file"):
+        if item["kind"] == "video":
+            # The recording and its MP4 belong to the user; only the preview goes.
+            if item.get("thumb"):
+                try:
+                    os.unlink(item["thumb"])
+                except OSError:
+                    pass
+        elif item.get("file"):
             try:
                 os.unlink(item["file"])
             except OSError:
@@ -483,8 +582,12 @@ class ThumbCache:
         if sha in self.pending:
             self.pending[sha].append(callback)
             return
+        path = item.get("thumb") if item["kind"] == "video" else item.get("file")
+        if not path:
+            callback(None)  # a video whose preview isn't made yet
+            return
         self.pending[sha] = [callback]
-        threading.Thread(target=self._load, args=(sha, item["file"]), daemon=True).start()
+        threading.Thread(target=self._load, args=(sha, path), daemon=True).start()
 
     def _load(self, sha, path):
         try:
@@ -506,6 +609,160 @@ class ThumbCache:
         for sha in list(self.textures):
             if sha not in keep_shas:
                 del self.textures[sha]
+
+
+# --------------------------------------------------------------------------
+# Screencasts (probed, previewed and converted off the main thread)
+# --------------------------------------------------------------------------
+
+class VideoWorker:
+    """Processes one video at a time with ffmpeg: waits for the recording to
+    be finished, reads its size and length, saves a preview frame and, for
+    WebM, writes an H.264/AAC MP4 next to it. Results are handed back on the
+    main loop through done(sha, result)."""
+
+    def __init__(self, done, progress=None):
+        self.done = done
+        self.progress = progress  # progress(sha, fraction), on the main loop
+        self.jobs = queue.Queue()
+        self.own_outputs = set()  # MP4s we write, so the folder watch skips them
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def submit(self, sha, src, convert):
+        self.jobs.put((sha, src, convert))
+
+    def _run(self):
+        while True:
+            sha, src, convert = self.jobs.get()
+            try:
+                result = self._process(sha, src, convert)
+            except Exception as e:  # noqa: BLE001
+                log(f"video processing failed for {src}: {e!r}")
+                result = {"status": "failed"}
+            GLib.idle_add(self.done, sha, result)
+
+    @staticmethod
+    def _wait_until_written(src):
+        """A recording grows until it is stopped; wait for its size to settle."""
+        last = -1
+        for _ in range(3600):
+            size = os.path.getsize(src)
+            if size == last and size > 0:
+                return size
+            last = size
+            time.sleep(1.0)
+        return last
+
+    @staticmethod
+    def _ffmpeg(args, timeout=None):
+        # Low priority: converting must not make the desktop stutter.
+        nice = ["nice", "-n", "10"] if shutil.which("nice") else []
+        return subprocess.run(nice + args, stdin=subprocess.DEVNULL, capture_output=True,
+                              text=True, timeout=timeout, check=False)
+
+    def _process(self, sha, src, convert):
+        if not os.path.isfile(src) or not self._wait_until_written(src):
+            return {"status": "failed"}
+        result = {"status": "ready", "file": src}
+        if not has_ffmpeg():
+            log("ffmpeg not found: screencasts are kept as recorded, without a preview")
+            return result
+
+        probe = self._ffmpeg(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                              "-show_entries", "stream=width,height:format=duration",
+                              "-of", "json", src], timeout=60)
+        try:
+            info = json.loads(probe.stdout or "{}")
+            stream = (info.get("streams") or [{}])[0]
+            result["width"], result["height"] = stream.get("width"), stream.get("height")
+            result["duration"] = float(info.get("format", {}).get("duration") or 0)
+        except (ValueError, TypeError):
+            pass
+        if probe.returncode != 0 or not result.get("width"):
+            log(f"not a readable video: {src}")
+            return {"status": "failed"}
+
+        os.makedirs(VIDEO_THUMBS_DIR, exist_ok=True)
+        thumb = os.path.join(VIDEO_THUMBS_DIR, sha + ".png")
+        # Seek after -i (decode up to it): GNOME's WebM recordings have one
+        # keyframe and no index, so seeking in the input lands mid-stream.
+        seek = "1" if result.get("duration", 0) > 2 else "0"
+        shot = self._ffmpeg(["ffmpeg", "-nostdin", "-y", "-v", "error", "-i", src, "-ss", seek,
+                             "-frames:v", "1", "-vf", f"scale='min({THUMB_W},iw)':-2",
+                             thumb], timeout=60)
+        if shot.returncode == 0 and os.path.exists(thumb):
+            result["thumb"] = thumb
+
+        if convert and src.lower().endswith(CONVERT_EXTS):
+            # Show the preview and length while it converts.
+            GLib.idle_add(self.done, sha, dict(result, status="processing", file=src))
+            mp4 = self._convert(src, sha, result.get("duration") or 0)
+            if mp4:
+                result["file"] = mp4
+        return result
+
+    def _report(self, sha, fraction):
+        if self.progress:
+            GLib.idle_add(lambda: self.progress(sha, fraction) and False)
+
+    def _encode(self, args, sha, duration):
+        """Run ffmpeg, reporting how much of the video is done from its
+        -progress output. Returns (returncode, stderr)."""
+        nice = ["nice", "-n", "10"] if shutil.which("nice") else []
+        args = args[:1] + ["-progress", "pipe:1", "-nostats"] + args[1:]
+        with tempfile.TemporaryFile(mode="w+") as err:
+            proc = subprocess.Popen(nice + args, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=err, text=True)
+            for line in proc.stdout:
+                key, _, value = line.strip().partition("=")
+                # out_time_us (out_time_ms is also in microseconds).
+                if key == "out_time_us" and duration > 0 and value.isdigit():
+                    self._report(sha, min(0.99, int(value) / 1e6 / duration))
+            proc.wait()
+            err.seek(0)
+            return proc.returncode, err.read()
+
+    def _convert(self, src, sha, duration):
+        """Write src as an MP4 (H.264 + AAC) next to it, or in the ShotClip
+        folder if that one is read-only. Returns its path, or None."""
+        base = os.path.splitext(os.path.basename(src))[0]
+        for folder in (os.path.dirname(src), VIDEOS_DIR):
+            try:
+                os.makedirs(folder, exist_ok=True)
+            except OSError:
+                continue
+            if not os.access(folder, os.W_OK):
+                continue
+            dest = os.path.join(folder, base + ".mp4")
+            n = 1
+            while os.path.exists(dest) and os.path.getsize(dest) > 0:
+                dest = os.path.join(folder, f"{base}-{n}.mp4")
+                n += 1
+            tmp = os.path.join(folder, f".{base}.mp4.part")
+            started = time.monotonic()
+            self._report(sha, 0.0)
+            returncode, stderr = self._encode([
+                "ffmpeg", "-nostdin", "-y", "-v", "error", "-i", src,
+                "-map", "0:v:0", "-map", "0:a?",
+                # yuv420p and even sizes: what players, browsers and phones accept.
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-pix_fmt", "yuv420p", "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
+                "-f", "mp4", tmp], sha, duration)
+            if returncode != 0 or not os.path.exists(tmp) or not os.path.getsize(tmp):
+                log(f"MP4 conversion failed for {src}: {stderr.strip()[-500:]}")
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                return None
+            self.own_outputs.add(dest)
+            os.replace(tmp, dest)
+            log(f"converted {os.path.basename(src)} -> {dest} "
+                f"({time.monotonic() - started:.0f} s)")
+            return dest
+        log(f"no writable folder for the MP4 of {src}")
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -592,6 +849,20 @@ flowboxchild:hover .shotclip-actions, flowboxchild:selected .shotclip-actions { 
 }
 .shotclip-tile .shotclip-thumb { border-radius: 12px 12px 0 0; }
 .shotclip-tile-text { padding: 12px 14px; /* 24px of TILE_PREVIEW_H */ font-size: 0.95em; line-height: 1.35; }
+.shotclip-play {
+  min-width: 34px; min-height: 34px; padding: 0; border-radius: 17px;
+  background: alpha(black, 0.55); color: white; box-shadow: none;
+}
+.shotclip-play:hover { background: alpha(black, 0.75); }
+.shotclip-player { background: black; }
+.shotclip-duration {
+  font-size: 0.72em; font-weight: 700; padding: 1px 6px; margin: 6px;
+  border-radius: 6px; background: alpha(black, 0.6); color: white;
+}
+.shotclip-progress { margin: 0 8px 8px 8px; }
+.shotclip-progress trough, .shotclip-progress progress { min-height: 4px; }
+.shotclip-compact-progress trough { min-width: 60px; min-height: 4px; }
+.shotclip-compact-progress progress { min-height: 4px; }
 .shotclip-tile-footer {
   padding: 4px 6px 4px 12px; min-height: 30px;
   border-top: 1px solid alpha(currentColor, 0.07);
@@ -599,6 +870,7 @@ flowboxchild:hover .shotclip-actions, flowboxchild:selected .shotclip-actions { 
 """
 
 LAYOUTS = (("list", "List"), ("compact", "Compact rows"), ("tiles", "Tiles"))
+THEME_LABELS = (("auto", "Follow system"), ("light", "Light"), ("dark", "Dark"))
 PREVIEW_H = 112  # height of an image preview in the list layout
 TILE_PREVIEW_H = 132
 TILE_COLUMNS = 3
@@ -669,6 +941,27 @@ class FixedLabel(Gtk.Label):
         return 0, 0, -1, -1
 
 
+def video_tag(item):
+    """Short state of a screencast for its card, or None when it's an MP4."""
+    if item.get("status") == "processing":
+        return "Converting…"
+    ext = os.path.splitext(item.get("file", ""))[1].lower()
+    return None if ext == ".mp4" else ext.lstrip(".").upper()
+
+
+def can_convert(item):
+    """A screencast still in WebM (or MKV) that can be converted to MP4 now."""
+    return (item["kind"] == "video" and item.get("status") != "processing"
+            and item.get("file", "").lower().endswith(CONVERT_EXTS) and has_ffmpeg())
+
+
+def item_name(item):
+    if item["kind"] == "video":
+        return os.path.basename(item.get("file") or item.get("source", "")) or "Screencast"
+    source = item.get("source", "")
+    return "Copied image" if source == "clipboard" else os.path.basename(source)
+
+
 def keycap(text):
     return Gtk.Label(label=text, css_classes=["shotclip-key"],
                      valign=Gtk.Align.CENTER, halign=Gtk.Align.CENTER)
@@ -682,6 +975,8 @@ class PickerWindow(Adw.ApplicationWindow):
         self.layout = app.config.get("layout", "list")
         self.was_active = False
         self.closing = False
+        self.dismiss_id = 0
+        self.progress_widgets = {}  # sha -> [(progress bar, tag label)]
         self.order = []
         self.has_pinned = False
         self.filter = "all"
@@ -787,14 +1082,15 @@ class PickerWindow(Adw.ApplicationWindow):
         box.set_tooltip_text(
             "Enter or click: paste\nShift+Enter: copy only\n1–9: paste that item\n"
             "Ctrl+Enter: paste with formatting\nP: pin or unpin\nDel: remove\n"
+            "Space: play a screencast\nC: convert a WebM screencast to MP4\n"
             "Ctrl+F: search\nCtrl+,: preferences\nCtrl+Shift+Del: clear unpinned\nEsc: close")
         return box
 
     def _make_filters(self):
         box = Gtk.Box(css_classes=["linked"], valign=Gtk.Align.CENTER)
         first = None
-        for key, label in (("all", "All"), ("image", "Images"), ("text", "Text"),
-                           ("pinned", "Pinned")):
+        for key, label in (("all", "All"), ("image", "Images"), ("video", "Videos"),
+                           ("text", "Text"), ("pinned", "Pinned")):
             btn = Gtk.ToggleButton(label=label, can_focus=False, active=key == "all")
             if first:
                 btn.set_group(first)
@@ -811,6 +1107,7 @@ class PickerWindow(Adw.ApplicationWindow):
 
     def refresh(self):
         selected = self._selected_sha()
+        self.progress_widgets = {}
         self.container.remove_all()
         everything = self.history.ordered()
         query = self.search_entry.get_text().strip().casefold()
@@ -852,14 +1149,15 @@ class PickerWindow(Adw.ApplicationWindow):
     def _matches(self, item, query):
         if self.filter == "pinned" and not item.get("pinned"):
             return False
-        if self.filter in ("image", "text") and item["kind"] != self.filter:
+        if self.filter in ("image", "video", "text") and item["kind"] != self.filter:
             return False
         if not query:
             return True
         if item["kind"] == "text":
             return query in item["text"].casefold()
         name = os.path.basename(item.get("source", ""))
-        return query in f"{name} image screenshot".casefold()
+        words = "video screencast recording" if item["kind"] == "video" else "image screenshot"
+        return query in f"{name} {words}".casefold()
 
     def _actions(self, item):
         sha = item["sha1"]
@@ -874,12 +1172,37 @@ class PickerWindow(Adw.ApplicationWindow):
                         can_focus=False, tooltip_text="Remove (Del)",
                         css_classes=["flat", "circular"])
         rm.connect("clicked", lambda *_: self.history.remove(sha))
+        if item["kind"] == "video" and self.layout == "compact":
+            play = Gtk.Button(icon_name="media-playback-start-symbolic", focus_on_click=False,
+                              can_focus=False, tooltip_text="Play (Space)",
+                              css_classes=["flat", "circular"])
+            play.connect("clicked", lambda *_: self._play(sha))
+            actions.append(play)
+        if can_convert(item):
+            convert = Gtk.Button(icon_name="emblem-synchronizing-symbolic", focus_on_click=False,
+                                 can_focus=False, tooltip_text="Convert to MP4 (C)",
+                                 css_classes=["flat", "circular"])
+            convert.connect("clicked", lambda *_: self._convert(sha))
+            actions.append(convert)
         actions.append(pin)
         actions.append(rm)
         return actions
 
+    def _play(self, sha):
+        item = self.history.get(sha)
+        if item and item["kind"] == "video":
+            VideoPlayerDialog(self, item).present(self)
+
+    def _convert(self, sha):
+        item = self.history.get(sha)
+        if item and can_convert(item):
+            self.app.convert_video(item)
+            self.toasts.add_toast(Adw.Toast(title="Converting to MP4…", timeout=2))
+
     @staticmethod
     def _kind_icon(item):
+        if item["kind"] == "video":
+            return "video-x-generic-symbolic"
         if item["kind"] != "text":
             return "image-x-generic-symbolic"
         return "insert-link-symbolic" if is_url(item["text"]) else "text-x-generic-symbolic"
@@ -889,17 +1212,71 @@ class PickerWindow(Adw.ApplicationWindow):
         child.pinned = bool(item.get("pinned"))
         if item["kind"] == "text":
             child.set_tooltip_text(item["text"][:500])
+        elif item["kind"] == "video":
+            lines = [os.path.basename(item.get("file", "")) or item_name(item)]
+            if item.get("width"):
+                lines.append(f"{item['width']} × {item['height']}   "
+                             f"{format_duration(item.get('duration'))}")
+            if item.get("status") == "processing":
+                lines.append("Converting to MP4…")
+            child.set_tooltip_text("\n".join(lines))
         else:
-            source = item.get("source", "")
-            origin = "Copied image" if source == "clipboard" else os.path.basename(source)
             child.set_tooltip_text(
-                f"{origin}\n{item.get('width', '?')} × {item.get('height', '?')}")
+                f"{item_name(item)}\n{item.get('width', '?')} × {item.get('height', '?')}")
         return child
 
-    def _thumb(self, item, height, width=0, **kwargs):
-        pic = Thumbnail(height, width, **kwargs)
+    def _progress_text(self, item, short=False, fraction=None):
+        if fraction is None:
+            fraction = self.app.video_progress.get(item["sha1"]) if item else None
+        if fraction is None:
+            return "…" if short else "Converting…"
+        return f"{int(fraction * 100)}%" if short else f"Converting {int(fraction * 100)}%"
+
+    def _video_tag(self, item, bar=None, short=False):
+        """The screencast's tag; while converting, it shows the percentage
+        and is updated live together with bar."""
+        if item.get("status") != "processing":
+            tag = video_tag(item)
+            return Gtk.Label(label=tag, valign=Gtk.Align.CENTER,
+                             css_classes=["shotclip-tag"]) if tag else None
+        label = Gtk.Label(label=self._progress_text(item, short), valign=Gtk.Align.CENTER,
+                          css_classes=["shotclip-tag"], tooltip_text="Converting to MP4")
+        self.progress_widgets.setdefault(item["sha1"], []).append((bar, label, short))
+        return label
+
+    def _progress_bar(self, item, **kwargs):
+        return Gtk.ProgressBar(fraction=self.app.video_progress.get(item["sha1"], 0),
+                               css_classes=["osd", "shotclip-progress"], **kwargs)
+
+    def update_progress(self, sha, fraction):
+        for bar, label, short in self.progress_widgets.get(sha, []):
+            if bar:
+                bar.set_fraction(fraction)
+            label.set_label(self._progress_text(None, short, fraction))
+
+    def _thumb(self, item, height, width=0, badges=True, **kwargs):
+        pic = Thumbnail(height, width, **({} if item["kind"] == "video" else kwargs))
         self.app.thumbs.request(item, lambda tex, p=pic: tex and p.set_paintable(tex))
-        return pic
+        if item["kind"] != "video":
+            return pic
+        # Videos: the preview frame with a play badge and the length on top.
+        overlay = Gtk.Overlay(child=pic, **kwargs)
+        if not badges:
+            return overlay
+        if item.get("status") == "processing":
+            overlay.bar = self._progress_bar(item, valign=Gtk.Align.END)
+            overlay.add_overlay(overlay.bar)
+        play = Gtk.Button(icon_name="media-playback-start-symbolic", can_focus=False,
+                          focus_on_click=False, tooltip_text="Play (Space)",
+                          halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER,
+                          css_classes=["circular", "shotclip-play"])
+        play.connect("clicked", lambda *_: self._play(item["sha1"]))
+        overlay.add_overlay(play)
+        if item.get("duration"):
+            overlay.add_overlay(Gtk.Label(
+                label=format_duration(item["duration"]), halign=Gtk.Align.END,
+                valign=Gtk.Align.END, css_classes=["shotclip-duration"]))
+        return overlay
 
     def _make_card(self, item, idx):
         card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
@@ -914,6 +1291,12 @@ class PickerWindow(Adw.ApplicationWindow):
                 css_classes=["shotclip-text"] + (["shotclip-link"] if link else []),
             ))
             meta = format_time(item.get("added", 0))
+        elif item["kind"] == "video":
+            thumb = self._thumb(item, PREVIEW_H, hexpand=True)
+            card.append(thumb)
+            meta = format_time(item.get("added", 0))
+            if item.get("status") != "processing":
+                meta += f"   {item_name(item)}"
         else:
             card.append(self._thumb(item, PREVIEW_H, hexpand=True))
             meta = f"{format_time(item.get('added', 0))}   " \
@@ -929,6 +1312,10 @@ class PickerWindow(Adw.ApplicationWindow):
             footer.append(Gtk.Label(label="Formatted", valign=Gtk.Align.CENTER,
                                     tooltip_text="Ctrl+Enter pastes it with formatting",
                                     css_classes=["shotclip-tag"]))
+        if item["kind"] == "video":
+            tag = self._video_tag(item, getattr(thumb, "bar", None))
+            if tag:
+                footer.append(tag)
         footer.append(self._actions(item))
         if idx < 9:
             footer.append(keycap(str(idx + 1)))
@@ -943,6 +1330,14 @@ class PickerWindow(Adw.ApplicationWindow):
             link = is_url(item["text"])
             text = one_line(item["text"])
             classes = ["shotclip-link"] if link else []
+        elif item["kind"] == "video":
+            box.append(self._thumb(item, 26, 40, badges=False, valign=Gtk.Align.CENTER))
+            parts = ["Screencast", format_duration(item.get("duration"))
+                     if item.get("duration") else ""]
+            if item.get("status") != "processing":
+                parts.append(video_tag(item) or "")
+            text = "  ".join(p for p in parts if p)
+            link, classes = False, ["dim-label"]
         else:
             box.append(self._thumb(item, 26, 40, valign=Gtk.Align.CENTER))
             source = item.get("source", "")
@@ -952,6 +1347,12 @@ class PickerWindow(Adw.ApplicationWindow):
         box.append(Gtk.Label(
             label=text, xalign=0, hexpand=True, max_width_chars=1, css_classes=classes,
             ellipsize=Pango.EllipsizeMode.MIDDLE if link else Pango.EllipsizeMode.END))
+        if item["kind"] == "video" and item.get("status") == "processing":
+            bar = Gtk.ProgressBar(fraction=self.app.video_progress.get(item["sha1"], 0),
+                                  valign=Gtk.Align.CENTER, width_request=60,
+                                  css_classes=["shotclip-compact-progress"])
+            box.append(bar)
+            box.append(self._video_tag(item, bar, short=True))
         box.append(self._actions(item))
         box.append(Gtk.Label(label=format_time(item.get("added", 0), short=True),
                              css_classes=["shotclip-meta"]))
@@ -971,12 +1372,17 @@ class PickerWindow(Adw.ApplicationWindow):
                 xalign=0, yalign=0, hexpand=True,
                 css_classes=["shotclip-tile-text"] + (["shotclip-link"] if link else [])))
         else:
-            tile.append(self._thumb(item, TILE_PREVIEW_H, hexpand=True))
+            thumb = self._thumb(item, TILE_PREVIEW_H, hexpand=True)
+            tile.append(thumb)
         footer = Gtk.Box(spacing=6, css_classes=["shotclip-tile-footer"])
         meta = "Pinned" if item.get("pinned") else format_time(item.get("added", 0))
         footer.append(Gtk.Label(label=meta, xalign=0, hexpand=True,
                                 ellipsize=Pango.EllipsizeMode.END,
                                 css_classes=["shotclip-meta"]))
+        if item["kind"] == "video":
+            tag = self._video_tag(item, getattr(thumb, "bar", None))
+            if tag:
+                footer.append(tag)
         footer.append(self._actions(item))
         if idx < 9:
             footer.append(keycap(str(idx + 1)))
@@ -1034,6 +1440,10 @@ class PickerWindow(Adw.ApplicationWindow):
     def _copy(self, sha, paste=True, formatted=False):
         item = self.history.get(sha)
         if not item:
+            return
+        if item["kind"] == "video" and item.get("status") == "processing":
+            self.toasts.add_toast(Adw.Toast(
+                title="This screencast is still being converted to MP4", timeout=3))
             return
         if not self.app.copy_item(item, formatted=formatted):
             self.toasts.add_toast(Adw.Toast(
@@ -1152,6 +1562,16 @@ class PickerWindow(Adw.ApplicationWindow):
             if sha:
                 self.history.toggle_pin(sha)
             return True
+        if name == "space":
+            sha = self._selected_sha()
+            if sha:
+                self._play(sha)
+            return True
+        if name in ("c", "C"):
+            sha = self._selected_sha()
+            if sha:
+                self._convert(sha)
+            return True
         if name in ("Delete", "KP_Delete"):
             sha = self._selected_sha()
             if sha:
@@ -1162,9 +1582,25 @@ class PickerWindow(Adw.ApplicationWindow):
     def _on_active_changed(self, *_):
         if self.is_active():
             self.was_active = True
-        elif self.was_active and not self.closing:
-            # Like Win+V: dismiss as soon as the user clicks elsewhere.
+        elif self.was_active and not self.closing and not self.dismiss_id:
+            # Like Win+V: dismiss as soon as the user clicks elsewhere. Checked
+            # a moment later: a dropdown opened in Preferences also takes the
+            # focus from the window, and that must not close the picker.
+            self.dismiss_id = GLib.timeout_add(150, self._dismiss_if_inactive)
+
+    def _dismiss_if_inactive(self):
+        self.dismiss_id = 0
+        if not self.closing and not self.is_active() and not self._own_popup_has_focus():
             self.close()
+        return GLib.SOURCE_REMOVE
+
+    def _own_popup_has_focus(self):
+        widget = self.get_focus()
+        while widget is not None:
+            if isinstance(widget, Gtk.Popover):
+                return widget.get_visible()
+            widget = widget.get_parent()
+        return False
 
     def _on_close_request(self, *_):
         self.detach()
@@ -1176,6 +1612,54 @@ class PickerWindow(Adw.ApplicationWindow):
             self.history.listeners.remove(self._listener)
         if self.app.window is self:
             self.app.window = None
+
+
+class VideoPlayerDialog(Adw.Dialog):
+    """Plays a screencast inside the picker (GTK's own GStreamer player)."""
+
+    def __init__(self, picker, item):
+        path = item["file"]
+        super().__init__(title=os.path.basename(path), content_width=720, content_height=480)
+        self.picker, self.sha = picker, item["sha1"]
+        self.video = Gtk.Video(file=Gio.File.new_for_path(path), autoplay=True,
+                               vexpand=True, hexpand=True, css_classes=["shotclip-player"])
+
+        header = Adw.HeaderBar()
+        paste = Gtk.Button(label="Paste", css_classes=["suggested-action"],
+                           tooltip_text="Paste the video file into the previous app")
+        paste.connect("clicked", self._on_paste)
+        header.pack_start(paste)
+        external = Gtk.Button(icon_name="adw-external-link-symbolic",
+                              tooltip_text="Open in the video player")
+        external.connect("clicked", self._on_external)
+        header.pack_end(external)
+
+        view = Adw.ToolbarView(content=self.video)
+        view.add_top_bar(header)
+        self.set_child(view)
+        self.connect("closed", self._on_closed)
+
+    def _stop(self):
+        stream = self.video.get_media_stream()
+        if stream:
+            stream.pause()
+        self.video.set_file(None)
+
+    def _on_closed(self, *_):
+        self._stop()
+
+    def _on_paste(self, *_):
+        self._stop()
+        self.close()
+        self.picker._copy(self.sha)
+
+    def _on_external(self, *_):
+        file = self.video.get_file()
+        self._stop()
+        self.close()
+        if file:
+            # The player takes the focus, so the picker closes behind it.
+            Gtk.FileLauncher.new(file).launch(self.picker, None, None)
 
 
 class PreferencesDialog(Adw.PreferencesDialog):
@@ -1196,6 +1680,13 @@ class PreferencesDialog(Adw.PreferencesDialog):
             selected=[k for k, _l in LAYOUTS].index(self.start_layout))
         self.layout_row.connect("notify::selected", self._on_layout)
         look.add(self.layout_row)
+        style = Adw.ComboRow(
+            title="Style", subtitle="Light, dark, or the same as the system",
+            model=Gtk.StringList.new([label for _key, label in THEME_LABELS]),
+            selected=[k for k, _l in THEME_LABELS].index(self.cfg["theme"]))
+        style.connect("notify::selected", lambda r, _p: self._set(
+            "theme", THEME_LABELS[r.get_selected()][0]))
+        look.add(style)
         page.add(look)
 
         hist = Adw.PreferencesGroup(title="History")
@@ -1209,6 +1700,21 @@ class PreferencesDialog(Adw.PreferencesDialog):
         hist.add(self._switch("capture_text", "Keep copied text",
                               "Off: only screenshots and images are kept"))
         page.add(hist)
+
+        vids = Adw.PreferencesGroup(
+            title="Screencasts",
+            description="Recordings made with the GNOME screenshot tool (Print Screen, "
+                        "then the camera button). Picking one pastes the file.")
+        vids.add(self._switch("capture_videos", "Keep screencasts",
+                              "Off: new recordings are not added"))
+        ffmpeg = has_ffmpeg()
+        convert = self._switch(
+            "convert_videos", "Convert to MP4",
+            "WebM recordings get an MP4 copy next to them, which every app can open"
+            if ffmpeg else "Needs ffmpeg: sudo apt install ffmpeg")
+        convert.set_sensitive(ffmpeg)
+        vids.add(convert)
+        page.add(vids)
 
         pick = Adw.PreferencesGroup(title="Picking an item")
         pick.add(self._switch("auto_paste", "Paste right away",
@@ -1226,10 +1732,13 @@ class PreferencesDialog(Adw.PreferencesDialog):
         self._fill_apps()
         page.add(self.excl)
 
-        folders = Adw.PreferencesGroup(title="Screenshot folders")
-        for d in getattr(app, "watch_dirs", []):
-            folders.add(Adw.ActionRow(title=d.replace(os.path.expanduser("~"), "~", 1),
-                                      subtitle="Set watch_dirs in config.json to change"))
+        folders = Adw.PreferencesGroup(title="Watched folders")
+        home = os.path.expanduser("~")
+        for dirs, what, key in ((getattr(app, "watch_dirs", []), "Screenshots", "watch_dirs"),
+                                (getattr(app, "video_dirs", []), "Screencasts", "video_dirs")):
+            for d in dirs:
+                folders.add(Adw.ActionRow(title=d.replace(home, "~", 1),
+                                          subtitle=f"{what} · set {key} in config.json to change"))
         page.add(folders)
 
         self.connect("closed", self._on_closed)
@@ -1292,6 +1801,9 @@ class ShotClipApp(Adw.Application):
         self.thumbs = ThumbCache()
         self.last_copied_sha = None
         self.echo_guard_until = 0.0
+        self.video_dirs = []
+        self.video_progress = {}  # sha -> fraction converted, while converting
+        self.videos = VideoWorker(self._on_video_done, self._on_video_progress)
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -1331,6 +1843,7 @@ class ShotClipApp(Adw.Application):
                 "ShotClip targets Wayland")
         self.config = load_config()
         self.config_mtime = self._config_mtime()
+        apply_theme(self.config["theme"])
         self.history = History(self.config["max_items"])
         first_run = not self.history.exists_on_disk
         self.history.load()
@@ -1342,16 +1855,23 @@ class ShotClipApp(Adw.Application):
             except (OSError, GLib.Error) as e:
                 log(f"desktop setup failed: {e}")
         self.watch_dirs = detect_screenshot_dirs(self.config)
+        self.video_dirs = detect_screencast_dirs(self.config)
         if first_run:
             self._import_existing(self.config["import_existing"])
+        if not os.path.exists(VIDEOS_IMPORTED_MARK):
+            self._import_existing_videos(IMPORT_EXISTING_VIDEOS)
         self.history.trim()
         self.history.save()
-        for d in self.watch_dirs:
+        for d in dict.fromkeys(self.watch_dirs + self.video_dirs):
             self._watch(d)
+        # Finish screencasts that were still being processed at the last exit.
+        for item in self.history.items:
+            if item["kind"] == "video" and item.get("status") == "processing":
+                self._process_video(item, convert=True if item.get("convert") else None)
         log(f"started (pid {os.getpid()}), {len(self.history.items)} item(s) in history")
         # Warm the thumbnail cache so the first picker opens instantly.
         for item in self.history.ordered():
-            if item["kind"] == "image":
+            if item["kind"] != "text":
                 self.thumbs.request(item, lambda _t: None)
 
     def do_command_line(self, cmdline):
@@ -1419,6 +1939,25 @@ class ShotClipApp(Adw.Application):
                 log(f"import failed for {path}: {e}")
         log(f"first run: imported {imported} existing screenshot(s)")
 
+    def _import_existing_videos(self, count):
+        if self.config.get("capture_videos", True):
+            files = []
+            for d in self.video_dirs:
+                try:
+                    for name in os.listdir(d):
+                        path = os.path.join(d, name)
+                        if (name.lower().endswith(CONVERT_EXTS) and not name.startswith(".")
+                                and os.path.isfile(path) and os.path.getsize(path)):
+                            files.append((os.path.getmtime(path), path))
+                except OSError as e:
+                    log(f"cannot list {d}: {e}")
+            for mtime, path in sorted(files)[-count:]:
+                self.history.add_video(path, added=mtime, notify=False)
+            log(f"imported {min(count, len(files))} existing screencast(s)")
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(VIDEOS_IMPORTED_MARK, "w", encoding="utf-8") as f:
+            f.write("1\n")
+
     def _watch(self, path):
         gfile = Gio.File.new_for_path(path)
         try:
@@ -1439,13 +1978,76 @@ class ShotClipApp(Adw.Application):
         else:
             return
         path = target.get_path() if target else None
-        if not path or not is_image_name(os.path.basename(path)):
+        if not path:
+            return
+        name = os.path.basename(path)
+        if is_video_name(name):
+            if (os.path.realpath(path) in self.videos.own_outputs
+                    or os.path.dirname(path) not in self.video_dirs):
+                return
+            settle, ingest = VIDEO_SETTLE_MS, self._ingest_video
+        elif is_image_name(name) and os.path.dirname(path) in self.watch_dirs:
+            settle, ingest = SETTLE_MS, self._ingest
+        else:
             return
         # Debounce: several events can arrive for one file.
         old = self.pending_files.pop(path, None)
         if old:
             GLib.source_remove(old)
-        self.pending_files[path] = GLib.timeout_add(SETTLE_MS, self._ingest, path)
+        self.pending_files[path] = GLib.timeout_add(settle, ingest, path)
+
+    def _ingest_video(self, path, apps=()):
+        self.pending_files.pop(path, None)
+        self._reload_config_if_changed()
+        if (not self.config.get("capture_videos", True) or not os.path.isfile(path)
+                or os.path.getsize(path) == 0
+                or os.path.realpath(path) in self.videos.own_outputs):
+            return GLib.SOURCE_REMOVE
+        item, new = self.history.add_video(path)
+        source = f" from {', '.join(apps)}" if apps else ""
+        log(f"added screencast {os.path.basename(path)}{source} -> {item['sha1'][:10]}")
+        if new:
+            self._process_video(item)
+        return GLib.SOURCE_REMOVE
+
+    def _process_video(self, item, convert=None):
+        item["status"] = "processing"
+        if convert is None:
+            convert = self.config.get("convert_videos", True)
+        self.videos.submit(item["sha1"], item["source"], convert)
+
+    def convert_video(self, item):
+        """Convert a WebM screencast now (automatic conversion is off, or it
+        failed before)."""
+        log(f"converting {os.path.basename(item['source'])} on request")
+        item["convert"] = True  # also after a restart mid-conversion
+        self._process_video(item, convert=True)
+        self.history.changed()
+
+    def _on_video_progress(self, sha, fraction):
+        self.video_progress[sha] = fraction
+        if self.window:
+            self.window.update_progress(sha, fraction)
+
+    def _on_video_done(self, sha, result):
+        """Called with the final result, and once before converting (status
+        still "processing") with the preview and length."""
+        if result.get("status") != "processing":
+            self.video_progress.pop(sha, None)
+        item = self.history.get(sha)
+        if item is None:
+            # Removed while it was being processed.
+            if result.get("thumb"):
+                try:
+                    os.unlink(result["thumb"])
+                except OSError:
+                    pass
+            return GLib.SOURCE_REMOVE
+        item.update(result)
+        item.pop("convert", None)
+        self.thumbs.textures.pop(sha, None)
+        self.history.changed()
+        return GLib.SOURCE_REMOVE
 
     def _ingest(self, path):
         self.pending_files.pop(path, None)
@@ -1466,6 +2068,17 @@ class ShotClipApp(Adw.Application):
     def _on_add_clip(self, _action, param):
         clip = param.unpack()
         html = clip.get("html")
+        if "files" in clip:
+            # Video files copied in a file manager (sent by extension >= 6).
+            self._reload_config_if_changed()
+            apps = clip.get("apps", [])
+            if self.config["exclude_apps"] and set(self.config["exclude_apps"]) & {
+                    a.casefold() for a in apps}:
+                return
+            for path in clip["files"]:
+                if is_video_name(os.path.basename(path)) and not self._is_echo_file(path):
+                    self._ingest_video(path, apps)
+            return
         self._add_clip(text=clip.get("text"), html=bytes(html) if html else None,
                        image=bytes(clip["image"]) if "image" in clip else None,
                        mime=clip.get("mime"), apps=clip.get("apps", []))
@@ -1497,6 +2110,11 @@ class ShotClipApp(Adw.Application):
                     f" -> {item['sha1'][:10]}")
                 self.thumbs.request(item, lambda _t: None)
 
+    def _is_echo_file(self, path):
+        item = self.history.find_video(os.path.realpath(path))
+        return item is not None and item["sha1"] == self.last_copied_sha \
+            and time.monotonic() < self.echo_guard_until
+
     def _is_echo(self, sha):
         # While ShotClip replaces the clipboard, GNOME can briefly restore the
         # previous content; don't let that bump an old item to the top.
@@ -1516,6 +2134,7 @@ class ShotClipApp(Adw.Application):
             self.config_mtime = mtime
             self.config = load_config()
             self.history.max_items = self.config["max_items"]
+            apply_theme(self.config["theme"])
             log("config reloaded")
 
     def save_config(self, cfg):
@@ -1523,6 +2142,7 @@ class ShotClipApp(Adw.Application):
         atomic_write_json(CONFIG_FILE, {k: cfg[k] for k in DEFAULT_CONFIG})
         self.config_mtime = self._config_mtime()
         self.config = load_config()
+        apply_theme(self.config["theme"])
         # Not trimmed yet: the Preferences dialog trims once it closes, so
         # stepping the number down doesn't delete items along the way.
         self.history.max_items = self.config["max_items"]
@@ -1571,6 +2191,12 @@ class ShotClipApp(Adw.Application):
             params = GLib.Variant("(ay)", (item["html"].encode("utf-8"),))
         elif item["kind"] == "text":
             method, params = "SetText", GLib.Variant("(s)", (item["text"],))
+        elif item["kind"] == "video":
+            # The file itself, as a file manager copies it: Files, browsers,
+            # chat and mail apps paste or attach it.
+            uri = Gio.File.new_for_path(item["file"]).get_uri()
+            method = "SetContent"
+            params = GLib.Variant("(say)", ("text/uri-list", f"{uri}\r\n".encode("utf-8")))
         else:
             with open(item["file"], "rb") as f:
                 data = f.read()

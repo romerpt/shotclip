@@ -19,9 +19,11 @@ Depends: ${misc:Depends},
          gir1.2-gdkpixbuf-2.0,
          gnome-shell (>= 48),
          systemd
+Recommends: ffmpeg
 Description: clipboard history for GNOME on Wayland (Super+V)
- ShotClip keeps the screenshots, images and text you copy and shows them in a
- picker on Super+V. Pick an item to paste it into the app you were using.
+ ShotClip keeps the screenshots, screencasts, images and text you copy and
+ shows them in a picker on Super+V. Screencasts recorded as WebM are
+ converted to MP4 (with ffmpeg) so any app can open them. Pick an item to paste it into the app you were using.
  Items can be pinned, searched and shown as a list, compact rows or tiles.
  .
  Wayland only lets GNOME Shell read the clipboard, so ShotClip includes a

@@ -54,6 +54,8 @@ missing=()
 for pkg in python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-gdkpixbuf-2.0; do
     dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed" || missing+=("$pkg")
 done
+# ffmpeg is optional: it converts WebM screencasts to MP4 and makes previews.
+command -v ffmpeg >/dev/null || missing+=(ffmpeg)
 if ((${#missing[@]})); then
     say "Installing missing packages: ${missing[*]}"
     sudo apt-get install -y "${missing[@]}"

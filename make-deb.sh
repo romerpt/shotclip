@@ -46,6 +46,7 @@ field() {  # field NAME: a field of the binary package stanza, joined on one lin
         END { print v }' "$SRC_DIR/debian/control"
 }
 depends="$(field Depends | sed 's/\${misc:Depends},[ ]*//')"
+recommends="$(field Recommends)"
 {
     echo "Package: shotclip"
     echo "Version: $CHANGELOG_VERSION"
@@ -55,6 +56,7 @@ depends="$(field Depends | sed 's/\${misc:Depends},[ ]*//')"
     echo "Maintainer: $(sed -n 's/^Maintainer: //p' "$SRC_DIR/debian/control")"
     echo "Installed-Size: $(du -sk --exclude=DEBIAN "$PKG" | cut -f1)"
     echo "Depends: $depends"
+    [[ -z "$recommends" ]] || echo "Recommends: $recommends"
     echo "Homepage: $(sed -n 's/^Homepage: //p' "$SRC_DIR/debian/control")"
     sed -n '/^Package:/,$p' "$SRC_DIR/debian/control" | sed -n '/^Description:/,$p'
 } >"$PKG/DEBIAN/control"

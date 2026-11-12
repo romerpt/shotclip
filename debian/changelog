@@ -1,3 +1,15 @@
+shotclip (1.1.0) resolute; urgency=medium
+
+  * Screencasts: recordings from the GNOME screenshot tool show up in the
+    picker, are converted from WebM to MP4 with ffmpeg (with a progress bar,
+    automatic or on request) and are pasted as a file.
+  * Play screencasts inside the picker (Space or the play button).
+  * Video files copied in Files are recorded.
+  * Light, dark or automatic style in Preferences.
+  * Fix: opening a dropdown in Preferences closed the picker.
+
+ -- Vitor Sousa <vitor.aos@gmail.com>  Thu, 12 Nov 2026 09:26:21 +0000
+
 shotclip (1.0.0) resolute; urgency=medium
 
   * Initial release.

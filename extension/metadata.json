@@ -1,13 +1,13 @@
 {
   "uuid": "shotclip@shotclip.github.io",
   "name": "ShotClip",
-  "description": "Clipboard history for screenshots, images and text, opened with Super+V.\n\nThis extension is the shell-side helper of the ShotClip app, which you need to install too: https://github.com/romerpt/shotclip\n\nWayland only lets GNOME Shell see the clipboard, so this extension: passes each copy (text, its formatting, or an image) and the id of the app it came from to the ShotClip app on your computer over D-Bus; sets the clipboard when you pick an item; and presses Shift+Insert in the focused app to paste it. Nothing leaves your computer. Copies that password managers mark as secret are ignored.",
+  "description": "Clipboard history for screenshots, images and text, opened with Super+V.\n\nThis extension is the shell-side helper of the ShotClip app, which you need to install too: https://github.com/romerpt/shotclip\n\nWayland only lets GNOME Shell see the clipboard, so this extension: passes each copy (text, its formatting, an image, or video files copied in Files) and the id of the app it came from to the ShotClip app on your computer over D-Bus; sets the clipboard when you pick an item; and presses Shift+Insert in the focused app to paste it. Nothing leaves your computer. Copies that password managers mark as secret are ignored.",
   "shell-version": [
     "48",
     "49",
     "50"
   ],
-  "version": 5,
+  "version": 6,
   "url": "https://github.com/romerpt/shotclip",
-  "version-name": "1.0.0"
+  "version-name": "1.1.0"
 }
